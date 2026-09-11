@@ -1,8 +1,8 @@
 {
-  "name": "aegiscode-desktop",
+  "name": "aegis-desktop",
   "productName": "AEGIS Desktop",
   "version": "0.3.0",
-  "description": "Thin Electron host for AEGIS — a local chat UI over the shared client/aegis.js transport. Ships transport + UI only; engine logic stays server-side.",
+  "description": "Thin Electron host for AEGIS — a local chat UI over the shared aegis.js transport (vendored here as vendor/aegis.js). Ships transport + UI only; engine logic stays server-side.",
   "author": {
     "name": "AEGIS Code",
     "email": "nborneklint@gmail.com"
@@ -11,22 +11,25 @@
   "private": true,
   "main": "main.js",
   "homepage": "https://aegiscloud.org",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aegiscloud/aegiscode-desktop.git"
+  },
+  "bin": {
+    "aegis": "bin/aegis.js"
+  },
   "scripts": {
     "start": "electron .",
     "predist": "node scripts/predist.mjs",
     "icon": "node scripts/generate-icon.mjs",
     "dist": "npm run predist && electron-builder",
     "dist:dir": "npm run predist && electron-builder --dir",
-    "check": "node --check main.js && node --check preload.js && node --check renderer/app.js && node --check renderer/max-tokens.js && node --check scripts/predist.mjs && node --check scripts/generate-icon.mjs && node --check lib/local/context.js && node --check lib/local/providers.js && node --check lib/local/ollama.js && node --check lib/local/engine.js && node --check lib/local/tools.js && node --check lib/local/prompt.js && node --check lib/local/shell.js && node --check lib/local/agents.js && node --check lib/settings.js && node --check lib/sync/sessions.js && node --check lib/sync/memory-queue.js",
-    "test:shell": "node ../test/desktop-shell.mjs",
-    "test:model": "node ../test/model-dispatch.mjs",
-    "test:max-tokens": "node ../test/max-tokens.test.mjs",
-    "test:foreign-memory": "node ../test/foreign-memory.test.mjs",
-    "test:tools": "node ../test/local-tools.test.mjs",
-    "test:engine": "node ../test/local-engine.test.mjs"
+    "check": "node --check main.js && node --check preload.js && node --check renderer/app.js && node --check renderer/max-tokens.js && node --check scripts/predist.mjs && node --check scripts/generate-icon.mjs && node --check lib/local/context.js && node --check lib/local/providers.js && node --check lib/local/ollama.js && node --check lib/local/engine.js && node --check lib/local/tools.js && node --check lib/local/prompt.js && node --check lib/local/shell.js && node --check lib/local/agents.js && node --check lib/settings.js && node --check lib/sync/sessions.js && node --check lib/sync/memory-queue.js && node --check bin/aegis.js"
+  },
+  "dependencies": {
+    "electron": "^33.0.0"
   },
   "devDependencies": {
-    "electron": "^33.0.0",
     "electron-builder": "^25.1.8"
   }
 }

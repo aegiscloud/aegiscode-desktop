@@ -1,37 +1,26 @@
 #!/usr/bin/env node
 /**
- * Pre-distribution step (Phase D3): stage the shared thin transport into the
- * app dir so the packaged app is self-contained.
+ * Pre-distribution sanity check (standalone repo variant).
  *
- * main.js resolves ../client/aegis.js in the repo (dev / CI / smoke tests) and
- * falls back to ./vendor/aegis.js when packaged — electron-builder cannot
- * reach files outside the app directory, so before every build we copy the
- * same thin client here. It is the same transport file, never brain logic.
+ * This repo is a `git subtree split` of aegiscode-plugin's desktop/ — the
+ * upstream monorepo copies ../client/aegis.js into vendor/ at build time,
+ * but there is no ../client here, so vendor/aegis.js and
+ * vendor/foreign-memory.js are committed directly as the source of truth.
+ * This step only verifies they exist before packaging; it never writes them.
  */
-import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const desktop = join(here, '..');
-const repo = join(desktop, '..');
-const destDir = join(desktop, 'vendor');
 
-// Files that live at the repo root (shared with the CLI/MCP host) but must be
-// present inside the app dir, because electron-builder cannot reach outside it.
-const staged = [
-  ['client', 'aegis.js'],
-  ['client', 'foreign-memory.js'],
-];
+const required = ['vendor/aegis.js', 'vendor/foreign-memory.js'];
 
-mkdirSync(destDir, { recursive: true });
-
-for (const segments of staged) {
-  const src = join(repo, ...segments);
-  const dest = join(destDir, segments[segments.length - 1]);
-  if (!existsSync(src)) {
-    throw new Error(`shared file not found at ${src} — run from the repo root`);
+for (const rel of required) {
+  const p = join(desktop, rel);
+  if (!existsSync(p)) {
+    throw new Error(`missing ${p} — this file must be committed, not generated`);
   }
-  copyFileSync(src, dest);
-  console.log(`staged ${dest}`);
+  console.log(`verified ${p}`);
 }
