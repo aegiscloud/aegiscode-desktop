@@ -13,9 +13,10 @@
  * selection, routed in the main process. If this file grows engine logic it is
  * wrong.
  *
- * `maxTokensCeiling`/`FLAT_CEILING` come from max-tokens.js, a sibling
- * classic script loaded before this one (see index.html) so the per-model
- * ceiling math stays unit-testable without window.aegis/window.models.
+ * `maxTokensCeiling`/`FLAT_CEILING` come from max-tokens.js and `usageTokens`
+ * from usage.js, sibling classic scripts loaded before this one (see
+ * index.html) so the per-model ceiling math and the token-usage → displayed
+ * number mapping stay unit-testable without window.aegis/window.models.
  */
 
 // Everything below runs inside an IIFE. preload.js's contextBridge.exposeInMainWorld
@@ -247,6 +248,79 @@ function abortBranches() {
     }
   }
   activeBranches.clear();
+}
+
+// ----------------------------------------------------------------- streaming
+// Two problems share a root: a running turn owns the transcript. It scrolls
+// the view on every chunk and repaints on every chunk, so the user can neither
+// read earlier turns nor stay responsive enough to hit "stop". Both are fixed
+// by giving the reader a veto over the scroll and batching the paints.
+//
+// The decisions *and* their DOM listeners live in transcript-view.js (a
+// sibling classic script loaded before this one), so the behaviours this path
+// exists to guarantee — follow only at the tail, one paint per frame, Escape
+// interrupts — are asserted against real code in test/renderer-dom.test.mjs
+// instead of only as pure math in stream-policy.js.
+
+/**
+ * Set when the user asks the running turn to stop. The abort comes back as a
+ * rejected IPC call, which does not preserve `err.name`, so this flag — not an
+ * AbortError check — is what distinguishes a stop the user asked for from a
+ * genuine failure.
+ */
+let userStopped = false;
+
+/**
+ * Transcript policy, created by init(): the reader's scroll veto, the
+ * frame-coalesced painter, and the Escape→stop listener all live in it. Built
+ * in init() rather than here because #messages does not exist until the body
+ * has parsed.
+ */
+let transcript = null;
+
+/**
+ * Auto-scroll only while the reader is still at the tail — the rule itself is
+ * `shouldFollow` in transcript-view.js. Null-safe: a boot that failed early
+ * must not turn into a second error on the first paint.
+ */
+function stickToBottom(opts) {
+  if (!transcript) return false;
+  return transcript.follow(opts);
+}
+
+/** One paint per frame, off the latest cumulative text — see transcript-view.js. */
+function rafPainter(paint) {
+  // Every caller runs after boot; painting directly is the safe degradation.
+  return transcript ? transcript.paint(paint) : paint;
+}
+
+/**
+ * Stop the turn running right now. The transport already honours the abort all
+ * the way down (engine.cancel -> AbortController -> the cloud client's fetch),
+ * so this only has to reach it — the button in the bubble and Escape are two
+ * doors onto the same call.
+ */
+function stopPendingTurn() {
+  if (!pendingSessionId) return false;
+  // Recorded before the abort lands: `send()`'s catch reads it to tell a
+  // deliberate stop from a real error.
+  userStopped = true;
+  try {
+    models.cancel(pendingSessionId);
+  } catch {
+    /* a dead controller is not an error */
+  }
+  // The abort is not instantaneous. Marking the button is all the feedback that
+  // survives the trip: `setBusy(false)` deletes the entire pending bubble on
+  // the way out, so anything written into it would vanish a moment later.
+  if (pendingEl) {
+    const btn = pendingEl.querySelector('.cancel-btn');
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = 'stopping…';
+    }
+  }
+  return true;
 }
 
 function exploreEnabled() {
@@ -1196,7 +1270,10 @@ function addMessage(role, text, meta, sessionId, toolLog) {
   }
 
   els.messages.appendChild(row);
-  els.messages.scrollTop = els.messages.scrollHeight;
+  // Follows only when the reader is still at the tail — see stickToBottom.
+  // A discrete new message must not drag the view away from someone reading
+  // history; the send path forces the follow explicitly instead.
+  stickToBottom();
   return row;
 }
 
@@ -1355,9 +1432,8 @@ async function spawnPath(card, spec) {
     const bits = [spec.path.title];
     if (data && data.model) bits.push(data.model);
     else if (spec.model) bits.push(spec.model);
-    if (data && data.usage && data.usage.total_tokens != null) {
-      bits.push(`${data.usage.total_tokens} tokens`);
-    }
+    const flowTokens = usageTokens(data && data.usage);
+    if (flowTokens != null) bits.push(`${flowTokens} tokens`);
     meta.textContent = bits.join(' · ');
   } catch (err) {
     const message = err && err.message ? err.message : String(err);
@@ -1440,9 +1516,9 @@ function setBusy(busy, { cancellable } = {}) {
       cancelBtn.type = 'button';
       cancelBtn.className = 'cancel-btn';
       cancelBtn.textContent = 'cancel';
-      cancelBtn.addEventListener('click', () => {
-        if (pendingSessionId) models.cancel(pendingSessionId);
-      });
+      // One path for both doors: the button and Escape must produce identical
+      // feedback, including the salvage `send()` performs.
+      cancelBtn.addEventListener('click', () => stopPendingTurn());
       pendingEl.appendChild(cancelBtn);
     }
   } else if (pendingEl) {
@@ -2166,6 +2242,9 @@ async function send() {
   }
 
   els.prompt.value = '';
+  // Clear the stop flag a previous turn may have left set, so a stale `true`
+  // can never make an unrelated failure look like a deliberate stop.
+  userStopped = false;
   addMessage('user', prompt);
 
   const ceiling = applyMaxTokensClamp(model);
@@ -2190,6 +2269,9 @@ async function send() {
   threadMessages.push({ role: 'user', content: prompt });
 
   setBusy(true, { cancellable: true });
+  // Sending is an explicit act, so it always returns the view to the tail.
+  // This is the single moment the auto-scroll overrides the reader's scroll.
+  stickToBottom({ force: true });
 
   // Persist the user turn locally (best-effort — never blocks chat).
   try {
@@ -2201,24 +2283,38 @@ async function send() {
   let streamedText = '';
   let reasoningText = '';
   const toolLog = [];
+
+  // Text arrives in dozens of small chunks per second; painting each one is
+  // what made the window feel locked up. One paint per frame, off the latest
+  // cumulative text.
+  const paintStream = rafPainter(() => {
+    if (!pendingEl) return;
+    pendingEl.classList.remove('pending');
+    if (reasoningText) {
+      const rEl = ensureReasoningEl(pendingEl);
+      if (rEl.textContent !== reasoningText) rEl.textContent = reasoningText;
+    }
+    const bodyEl = pendingEl.querySelector('.body');
+    if (bodyEl && bodyEl.textContent !== streamedText) bodyEl.textContent = streamedText;
+    stickToBottom();
+  });
+
   const onDelta = (chunk) => {
     // Extended-reasoning trace from a pooled brain turn: the fan-out's worker
     // findings, streamed before the synthesis pass writes the answer. Shown so
     // "work autonomously" doesn't look idle for the whole worker phase.
     if (chunk && typeof chunk.reasoning === 'string' && chunk.reasoning) {
       reasoningText += chunk.reasoning;
-      if (pendingEl) {
-        pendingEl.classList.remove('pending');
-        ensureReasoningEl(pendingEl).textContent = reasoningText;
-        els.messages.scrollTop = els.messages.scrollHeight;
-      }
+      paintStream();
       return;
     }
     if (chunk && chunk.approval) {
       if (pendingEl) {
         pendingEl.classList.remove('pending');
         renderApprovalCard(pendingEl, chunk.approval, '.body');
-        els.messages.scrollTop = els.messages.scrollHeight;
+        // Forced on purpose: the turn is blocked until this is answered, so
+        // the card has to be brought into view even if the reader scrolled up.
+        stickToBottom({ force: true });
       }
       return;
     }
@@ -2227,7 +2323,7 @@ async function send() {
       if (pendingEl) {
         pendingEl.classList.remove('pending');
         appendToolActivity(pendingEl, chunk.tool, 'tool-activity', '.body');
-        els.messages.scrollTop = els.messages.scrollHeight;
+        stickToBottom();
       }
       return;
     }
@@ -2235,11 +2331,7 @@ async function send() {
       chunk && (typeof chunk.delta === 'string' ? chunk.delta : chunk.content);
     if (!delta) return;
     streamedText += delta;
-    if (!pendingEl) return;
-    pendingEl.classList.remove('pending');
-    const bodyEl = pendingEl.querySelector('.body');
-    if (bodyEl) bodyEl.textContent = streamedText;
-    els.messages.scrollTop = els.messages.scrollHeight;
+    paintStream();
   };
 
   try {
@@ -2261,9 +2353,8 @@ async function send() {
     else if (model) bits.push(`model: ${model}`);
     bits.push(classLabel(cls));
     if (autonomous) bits.push(`autonomous (${effort}, ${workers || 3}w)`);
-    if (data && data.usage && data.usage.total_tokens != null) {
-      bits.push(`tokens: ${data.usage.total_tokens}`);
-    }
+    const turnTokens = usageTokens(data && data.usage);
+    if (turnTokens != null) bits.push(`tokens: ${turnTokens}`);
     addMessage('assistant', text, bits.join(' · ') || undefined, sessionId, toolLog);
 
     try {
@@ -2279,11 +2370,27 @@ async function send() {
       addFlowLane({ prompt, cls, model, maxTokens, parentSessionId: sessionId });
     }
   } catch (err) {
-    addMessage(
-      'assistant',
-      `Error: ${err && err.message ? err.message : err}`,
-      'request failed'
-    );
+    // A stop is not a failure. The transport rethrows on abort — the SSE read
+    // rejects and the loop re-raises — so the naive path here would discard
+    // everything already streamed and answer with a red "aborted" error,
+    // destroying the partial reply at the exact moment the user asked to keep
+    // it. Salvage the partial turn and label it honestly instead.
+    if (isCancellation(err, { userStopped })) {
+      const text = streamedText || reasoningText || '(stopped before any output)';
+      threadMessages.push({ role: 'assistant', content: text });
+      addMessage('assistant', text, 'stopped by you', sessionId, toolLog);
+      try {
+        await sync.append(sessionId, { role: 'assistant', content: text });
+      } catch {
+        /* persistence is non-fatal */
+      }
+    } else {
+      addMessage(
+        'assistant',
+        `Error: ${err && err.message ? err.message : err}`,
+        'request failed'
+      );
+    }
   } finally {
     setBusy(false);
     pendingSessionId = null;
@@ -2452,8 +2559,37 @@ async function init() {
       renderMemoryOverlay();
     });
   }
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && overlayOpen()) closeMemoryOverlay();
+  // The transcript's scroll/paint/Escape policy. Both listeners are registered
+  // inside transcript-view.js so the behaviours they enforce are the ones
+  // test/renderer-dom.test.mjs drives: the passive `scroll` listener is the
+  // reader's veto over the streaming auto-scroll (without it the transcript
+  // stays pinned to the tail no matter how far up you read while a model is
+  // working), and the `keydown` listener is Escape-as-interrupt (the keyboard
+  // twin of the cancel button, for the window that is too busy to aim at it).
+  transcript = createTranscriptView({
+    messages: els.messages,
+    requestFrame: (fn) => requestAnimationFrame(fn),
+  });
+  transcript.attachScrollVeto();
+  // Read-only diagnostic surface for the headless smoke run
+  // (test/electron-smoke.mjs). Everything in this file lives inside the IIFE,
+  // so an injected script cannot otherwise see the scroll veto — the Phase 9
+  // harness read `transcript.isScrolledUp()` directly and silently got `null`,
+  // which made its veto assertion unfalsifiable. Exposes state only: no
+  // setters, nothing that can drive the UI. Frozen so a stray write in a test
+  // cannot fake a passing run.
+  window.__aegisSmoke = Object.freeze({
+    isScrolledUp: () => transcript.isScrolledUp(),
+    metrics: () => transcript.metrics(),
+  });
+  bindEscapeInterrupt({
+    doc: document,
+    // The memory overlay wins: while it is open, Escape closes it rather than
+    // reaching past it to cancel a turn the user may not be looking at.
+    isOverlayOpen: overlayOpen,
+    onOverlayEscape: closeMemoryOverlay,
+    hasPendingTurn: () => !!pendingSessionId,
+    stopTurn: stopPendingTurn,
   });
 
   // Auto-update banner: `?`-guarded like the memory inspector above, since
