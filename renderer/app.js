@@ -31,6 +31,7 @@
 const aegis = window.aegis;
 const models = window.models;
 const sync = window.sync;
+const quickLauncher = window.quickLauncher;
 
 if (!aegis || !models) {
   document.body.textContent =
@@ -45,6 +46,11 @@ if (!aegis || !models) {
 // getters re-read the live DOM on each access, so boot order can never cause
 // that failure mode.
 const ELEMENT_IDS = {
+  updateBanner: 'update-banner',
+  updateBannerText: 'update-banner-text',
+  updateDownloadBtn: 'update-download-btn',
+  updateRestartBtn: 'update-restart-btn',
+  updateLaterBtn: 'update-later-btn',
   connDot: 'conn-dot',
   connText: 'conn-text',
   app: 'st-app',
@@ -71,7 +77,14 @@ const ELEMENT_IDS = {
   modelHint: 'model-hint',
   settingsList: 'settings-list',
   settingsHint: 'settings-hint',
+  quickLauncherEnabled: 'quick-launcher-enabled',
+  quickLauncherShortcut: 'quick-launcher-shortcut',
+  quickLauncherSave: 'quick-launcher-save',
+  quickLauncherHint: 'quick-launcher-hint',
+  confirmMode: 'confirm-mode-toggle',
+  confirmModeHint: 'confirm-mode-hint',
   sessionsRefresh: 'sessions-refresh',
+  sessionsExport: 'sessions-export',
   sessionsList: 'sessions-list',
   sessionsHint: 'sessions-hint',
   syncNow: 'sync-now',
@@ -278,6 +291,55 @@ function renderStatus(s) {
   setConn(s.keyConfigured, s.keyConfigured ? 'key configured' : 'no API key');
 }
 
+// -------------------------------------------------------------- auto-update
+//
+// Mirrors the state machine in desktop/main.js createUpdateManager: 'idle' /
+// 'disabled' (dev build) / 'checking' / 'up-to-date' render nothing, since
+// none of them need the user's attention. `updateDismissedFor` remembers the
+// status the user last clicked "Later" on, so the banner stays gone for that
+// status (an hourly re-check finding the SAME pending update shouldn't keep
+// resurrecting a banner the user already dismissed) while still reappearing
+// the moment the status actually advances (e.g. available -> downloaded).
+let lastUpdateState = null;
+let updateDismissedFor = null;
+
+function renderUpdateBanner(state) {
+  if (!els.updateBanner) return;
+  lastUpdateState = state;
+  const status = state && state.status;
+  const silent = !status || status === 'idle' || status === 'disabled' ||
+    status === 'checking' || status === 'up-to-date';
+  if (silent || status === updateDismissedFor) {
+    els.updateBanner.hidden = true;
+    return;
+  }
+
+  let text = '';
+  let showDownload = false;
+  let showRestart = false;
+  const version = state.version ? `v${state.version} ` : '';
+  if (status === 'available') {
+    text = `Update ${version}available.`;
+    showDownload = true;
+  } else if (status === 'downloading') {
+    const pct = typeof state.progress === 'number' ? ` (${Math.round(state.progress)}%)` : '';
+    text = `Downloading update${pct}…`;
+  } else if (status === 'downloaded') {
+    text = `Update ${version}downloaded — restart to install.`;
+    showRestart = true;
+  } else if (status === 'error') {
+    text = `Update check failed: ${state.error || 'unknown error'}`;
+  } else {
+    els.updateBanner.hidden = true;
+    return;
+  }
+
+  els.updateBannerText.textContent = text;
+  els.updateDownloadBtn.hidden = !showDownload;
+  els.updateRestartBtn.hidden = !showRestart;
+  els.updateBanner.hidden = false;
+}
+
 async function loadAccountInfo() {
   try {
     const verify = await aegis.verifyApiKey();
@@ -349,6 +411,126 @@ async function verifyAegisKey() {
   } finally {
     els.apiKeyVerify.disabled = false;
   }
+}
+
+// --------------------------------------------------------- quick launcher
+
+/** Render a `{ enabled, shortcut, packaged, active, reason }` status (see
+ *  main.js createQuickLauncherDispatch) into the settings card. */
+function renderQuickLauncherStatus(status) {
+  if (!status) return;
+  els.quickLauncherEnabled.checked = Boolean(status.enabled);
+  els.quickLauncherShortcut.value = status.shortcut || '';
+  els.quickLauncherShortcut.placeholder = status.shortcut || 'CmdOrCtrl+Shift+Space';
+  const bits = [];
+  if (status.packaged) bits.push('always on in this packaged build');
+  bits.push(status.active ? `active — press ${status.shortcut} anywhere` : 'inactive');
+  if (status.reason) bits.push(status.reason);
+  els.quickLauncherHint.textContent = bits.join(' · ');
+}
+
+async function loadQuickLauncherSettings() {
+  if (!quickLauncher) return;
+  try {
+    renderQuickLauncherStatus(await quickLauncher.status());
+  } catch (err) {
+    els.quickLauncherHint.textContent =
+      `status failed: ${err && err.message ? err.message : err}`;
+  }
+}
+
+async function saveQuickLauncherSettings() {
+  if (!quickLauncher) return;
+  els.quickLauncherSave.disabled = true;
+  els.quickLauncherHint.textContent = 'saving…';
+  try {
+    renderQuickLauncherStatus(
+      await quickLauncher.setConfig({
+        enabled: els.quickLauncherEnabled.checked,
+        shortcut: els.quickLauncherShortcut.value.trim(),
+      })
+    );
+  } catch (err) {
+    els.quickLauncherHint.textContent =
+      `save failed: ${err && err.message ? err.message : err}`;
+  } finally {
+    els.quickLauncherSave.disabled = false;
+  }
+}
+
+// ------------------------------------------------------ tool approvals
+//
+// "Confirm before running tools" — the user-facing ON/OFF switch for the
+// engine's tool-call approval gate (desktop/lib/local/engine.js
+// gatedExecuteTool; persisted by same-named IPC methods on
+// createConfirmModeDispatch). ON (the default, and the behaviour every
+// existing install has) previews exec/writeFile/editFile and asks before they
+// run; OFF runs them straight through, exactly like a tool already allowed for
+// the session — no approval card at all. The engine reads the flag per tool
+// call, so a flip here applies to the next call in flight, no restart.
+
+/** Paint a `{ enabled }` payload (from aegis.getConfirmMode/setConfirmMode)
+ *  into the card, and say plainly what the current state means. */
+function renderConfirmMode(status) {
+  if (!els.confirmMode || !status) return;
+  const enabled = status.enabled !== false;
+  els.confirmMode.checked = enabled;
+  els.confirmModeHint.textContent = enabled
+    ? 'On — exec, writeFile and editFile ask for your approval before they run.'
+    : 'Off — the agent runs exec, writeFile and editFile without asking.';
+}
+
+/** Read the persisted value. Called on boot (the Settings pane is a single
+ *  always-visible column, so that is "when Settings opens") and again on every
+ *  change via saveConfirmMode below. */
+async function loadConfirmMode() {
+  if (!els.confirmMode || !aegis.getConfirmMode) return;
+  try {
+    renderConfirmMode(await aegis.getConfirmMode());
+  } catch (err) {
+    els.confirmModeHint.textContent =
+      `status failed: ${err && err.message ? err.message : err}`;
+  }
+}
+
+/** Persist a flip of the switch. The card is only repainted from what the
+ *  main process actually stored, so a failed write leaves the switch showing
+ *  the truth rather than the click. */
+async function saveConfirmMode(enabled) {
+  if (!els.confirmMode) return;
+  els.confirmMode.disabled = true;
+  try {
+    renderConfirmMode(await aegis.setConfirmMode(enabled));
+  } catch (err) {
+    els.confirmMode.checked = !enabled;
+    els.confirmModeHint.textContent =
+      `save failed: ${err && err.message ? err.message : err}`;
+  } finally {
+    els.confirmMode.disabled = false;
+  }
+}
+
+/**
+ * Land a quick-launcher answer (main.js QUICK_LAUNCHER_PUSH_CHANNEL, see
+ * preload.js onQuickLauncherPush) as a real turn in the open thread — same
+ * "renderer owns the state, main.js just pings" split every other menu
+ * channel in this file uses (onMenuNewChat, onMenuSearch, …). Starts a fresh
+ * thread first if none is open yet, exactly like send() does for a first
+ * message, then persists both turns via sync.append — the same call send()
+ * makes — so the pushed Q&A survives exactly like one typed in this window.
+ */
+function handleQuickLauncherPush(payload) {
+  const prompt = payload && payload.prompt;
+  const response = payload && payload.response;
+  if (!prompt || !response) return;
+  if (!currentSessionId) currentSessionId = newSessionId();
+  const sessionId = currentSessionId;
+  addMessage('user', prompt);
+  addMessage('assistant', response, undefined, sessionId);
+  threadMessages.push({ role: 'user', content: prompt });
+  threadMessages.push({ role: 'assistant', content: response });
+  sync.append(sessionId, { role: 'user', content: prompt }).catch(() => {});
+  sync.append(sessionId, { role: 'assistant', content: response }).catch(() => {});
 }
 
 // ----------------------------------------------------------------- memory
@@ -945,6 +1127,26 @@ function hideWelcome() {
   if (w) w.remove();
 }
 
+// Assistant text is rendered as sanitized markdown (headings, lists, links,
+// highlighted fenced code with a copy button — see renderer/markdown.js);
+// user text always stays plain via textContent, and this is the only place
+// that decides which one a role gets. AegisMarkdown.renderInto() itself
+// falls back to textContent if marked/DOMPurify failed to load, so this
+// never risks putting raw model output into innerHTML.
+function renderMessageBody(bodyEl, role, text) {
+  if (role === 'assistant' && window.AegisMarkdown) {
+    // Rendered markdown supplies its own block spacing (marked emits real
+    // <p>/<pre>/<li> elements); the plain-text `white-space: pre-wrap` on
+    // .body/.flow-body would otherwise turn the newlines *between* those
+    // tags into extra visible blank lines. md-body opts back to normal flow.
+    bodyEl.classList.add('md-body');
+    window.AegisMarkdown.renderInto(bodyEl, text);
+  } else {
+    bodyEl.classList.remove('md-body');
+    bodyEl.textContent = text;
+  }
+}
+
 // `sessionId`, when given for an assistant message, renders a "copy" button
 // that puts the message text on the clipboard. `toolLog` (assistant only) is
 // the turn's collected `{name, args, ok}` tool calls, rendered above the
@@ -962,7 +1164,7 @@ function addMessage(role, text, meta, sessionId, toolLog) {
 
   const body = document.createElement('div');
   body.className = 'body';
-  body.textContent = text;
+  renderMessageBody(body, role, text);
 
   row.appendChild(who);
   if (Array.isArray(toolLog) && toolLog.length) {
@@ -1088,6 +1290,14 @@ async function spawnPath(card, spec) {
 
   let streamed = '';
   const onDelta = (chunk) => {
+    if (chunk && chunk.approval) {
+      if (card.classList.contains('pending')) {
+        card.classList.remove('pending');
+        state.textContent = 'needs approval';
+      }
+      renderApprovalCard(card, chunk.approval, '.flow-body');
+      return;
+    }
     if (chunk && chunk.tool) {
       if (card.classList.contains('pending')) {
         card.classList.remove('pending');
@@ -1123,6 +1333,12 @@ async function spawnPath(card, spec) {
         prompt: `Original request:\n${spec.prompt}\n\n${spec.path.hint}`,
         model: spec.model,
         maxTokens: Math.min(spec.maxTokens || 1024, 1024),
+        // A single-shot summariser: one lead line and 3-5 bullets, no tools.
+        // Without this the engine puts the agent loop (and its tool schemas)
+        // behind a 1024-token budget, and a turn that comes back with neither
+        // text nor a tool call would trigger the empty-turn recovery — an
+        // extra dispatch this lane has no gathered context to justify.
+        tools: false,
         sessionId: id,
       },
       onDelta
@@ -1131,7 +1347,7 @@ async function spawnPath(card, spec) {
     const choice = (data && data.choices && data.choices[0]) || {};
     const text =
       (choice.message && choice.message.content) || streamed || '(no path found)';
-    body.textContent = text;
+    renderMessageBody(body, 'assistant', text);
     card.classList.remove('pending');
     card.classList.add('done');
     state.textContent = 'done';
@@ -1267,6 +1483,128 @@ function appendToolActivity(row, tool, containerClass, beforeSelector) {
   line.textContent = toolActivityLabel(tool);
   toolsEl.appendChild(line);
   return toolsEl;
+}
+
+/**
+ * Lazily create a message row's extended-reasoning block and return it.
+ *
+ * Only pooled brain turns emit `reasoning` deltas (the "work autonomously"
+ * fan-out's worker findings), so this block exists for AEGIS Cloud autonomous
+ * turns and nowhere else. It sits ABOVE `.body` — deliberation first, then the
+ * answer the synthesis pass writes — and is transient UI: it is never pushed
+ * into the thread history, so it cannot leak back into the model's context.
+ */
+function ensureReasoningEl(row) {
+  let el = row.querySelector('.reasoning');
+  if (!el) {
+    el = document.createElement('div');
+    el.className = 'reasoning';
+    const body = row.querySelector('.body');
+    if (body) row.insertBefore(el, body);
+    else row.appendChild(el);
+  }
+  return el;
+}
+
+/** The one-line summary shown above an approval card's diff (or alone, for
+ *  exec, which has none). */
+function approvalSummary(tool, args) {
+  const a = args || {};
+  if (tool === 'exec') return a.description ? `${a.command} — ${a.description}` : a.command || '';
+  return a.file_path || '';
+}
+
+/**
+ * Render one +/- colored line of a unified diff. `@@` hunk headers and the
+ * `---`/`+++` file headers get their own class; everything else falls back
+ * to a plain context line.
+ */
+function diffLineClass(line) {
+  if (line.startsWith('@@')) return 'diff-hunk';
+  if (line.startsWith('+++') || line.startsWith('---')) return 'diff-file';
+  if (line.startsWith('+')) return 'diff-add';
+  if (line.startsWith('-')) return 'diff-del';
+  return 'diff-ctx';
+}
+
+/**
+ * Render one tool-call approval card (`onDelta`'s `{ approval: {id, tool,
+ * args, diff} }` chunk — see desktop/lib/local/engine.js requestApproval)
+ * into `row`, before it runs. The three buttons resolve the main process's
+ * pending promise via models.respondApproval; the card disables itself the
+ * instant one is clicked so a double-click can't send two decisions for the
+ * same id.
+ */
+function renderApprovalCard(row, approval, beforeSelector) {
+  if (!row || !approval) return;
+
+  const card = document.createElement('div');
+  card.className = 'approval-card';
+  card.dataset.approvalId = approval.id;
+
+  const title = document.createElement('div');
+  title.className = 'approval-title';
+  title.textContent = `${approval.tool} wants to run — review before it executes`;
+  card.appendChild(title);
+
+  const summary = approvalSummary(approval.tool, approval.args);
+  if (summary) {
+    const summaryEl = document.createElement('div');
+    summaryEl.className = 'approval-summary';
+    summaryEl.textContent = summary;
+    card.appendChild(summaryEl);
+  }
+
+  if (approval.diff) {
+    const diffEl = document.createElement('pre');
+    diffEl.className = 'approval-diff';
+    for (const line of approval.diff.split('\n')) {
+      const lineEl = document.createElement('div');
+      lineEl.className = diffLineClass(line);
+      lineEl.textContent = line;
+      diffEl.appendChild(lineEl);
+    }
+    card.appendChild(diffEl);
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'approval-actions';
+
+  const decide = (decision) => {
+    for (const btn of actions.querySelectorAll('button')) btn.disabled = true;
+    card.classList.add('resolved');
+    const tag = document.createElement('div');
+    tag.className = 'approval-decision';
+    tag.textContent =
+      decision === 'deny' ? 'Denied' : decision === 'session' ? 'Allowed for this session' : 'Allowed once';
+    card.appendChild(tag);
+    models.respondApproval(approval.id, decision);
+  };
+
+  const mkButton = (label, cls, decision) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = `approval-btn ${cls}`;
+    btn.textContent = label;
+    btn.addEventListener('click', () => decide(decision));
+    return btn;
+  };
+
+  actions.appendChild(mkButton('Allow once', 'allow', 'once'));
+  actions.appendChild(mkButton('Allow for this session', 'allow-session', 'session'));
+  actions.appendChild(mkButton('Deny', 'deny', 'deny'));
+  card.appendChild(actions);
+
+  let slot = row.querySelector('.approval-slot');
+  if (!slot) {
+    slot = document.createElement('div');
+    slot.className = 'approval-slot';
+    const before = beforeSelector ? row.querySelector(beforeSelector) : null;
+    if (before) row.insertBefore(slot, before);
+    else row.appendChild(slot);
+  }
+  slot.appendChild(card);
+  return card;
 }
 
 function classLabel(cls) {
@@ -1741,8 +2079,42 @@ function openSession(id) {
     });
 }
 
+/**
+ * Export the open thread to a user-picked file — Markdown or JSON, both
+ * serialized in main.js from the same lib/sync/sessions.js record `sync.*`
+ * already uses as the source of truth. One code path for all three entry
+ * points: the sidebar's Export button and both File-menu items (see boot()
+ * wiring below) call this with the format they want.
+ */
+function exportSession(format) {
+  const id = currentSessionId;
+  if (!id) {
+    els.sessionsHint.textContent = 'no open session to export';
+    return;
+  }
+  aegis.exportSession(id, format)
+    .then((result) => {
+      if (result && result.ok) {
+        els.sessionsHint.textContent = `exported to ${result.filePath}`;
+      } else if (!result || !result.canceled) {
+        els.sessionsHint.textContent =
+          `export failed: ${(result && result.reason) || 'unknown error'}`;
+      }
+    })
+    .catch((err) => {
+      els.sessionsHint.textContent =
+        `export failed: ${err && err.message ? err.message : err}`;
+    });
+}
+
 function newChat() {
   abortBranches();
+  // A fresh thread must never inherit the outgoing one's "allow for this
+  // session" tool grants (desktop/lib/local/engine.js sessionAllowlists is
+  // keyed by this exact id) — best-effort, never blocks starting the chat.
+  if (currentSessionId) {
+    models.clearApprovals(currentSessionId).catch(() => {});
+  }
   renderWelcome();
   els.sessionsHint.textContent = '';
   pendingEl = null;
@@ -1750,6 +2122,28 @@ function newChat() {
   currentSessionId = null;
   threadMessages = [];
   flowCount = 0;
+}
+
+/**
+ * Route a resolved aegis:// link (main.js DEEP_LINK_CHANNEL, see
+ * preload.js onDeepLink) into the UI: `open` jumps straight to the named
+ * session; `new` starts a fresh thread with the prompt prefilled in the
+ * composer — prefilled, not auto-sent, so the user still confirms before
+ * anything reaches a model.
+ */
+function handleDeepLink(parsed) {
+  if (!parsed) return;
+  if (parsed.action === 'open' && parsed.sessionId) {
+    openSession(parsed.sessionId);
+    return;
+  }
+  if (parsed.action === 'new') {
+    newChat();
+    if (parsed.prompt) {
+      els.prompt.value = parsed.prompt;
+      els.prompt.focus();
+    }
+  }
 }
 
 // ------------------------------------------------------------------ actions
@@ -1805,8 +2199,29 @@ async function send() {
   }
 
   let streamedText = '';
+  let reasoningText = '';
   const toolLog = [];
   const onDelta = (chunk) => {
+    // Extended-reasoning trace from a pooled brain turn: the fan-out's worker
+    // findings, streamed before the synthesis pass writes the answer. Shown so
+    // "work autonomously" doesn't look idle for the whole worker phase.
+    if (chunk && typeof chunk.reasoning === 'string' && chunk.reasoning) {
+      reasoningText += chunk.reasoning;
+      if (pendingEl) {
+        pendingEl.classList.remove('pending');
+        ensureReasoningEl(pendingEl).textContent = reasoningText;
+        els.messages.scrollTop = els.messages.scrollHeight;
+      }
+      return;
+    }
+    if (chunk && chunk.approval) {
+      if (pendingEl) {
+        pendingEl.classList.remove('pending');
+        renderApprovalCard(pendingEl, chunk.approval, '.body');
+        els.messages.scrollTop = els.messages.scrollHeight;
+      }
+      return;
+    }
     if (chunk && chunk.tool) {
       toolLog.push(chunk.tool);
       if (pendingEl) {
@@ -1951,8 +2366,26 @@ async function init() {
   });
 
   els.newChat.addEventListener('click', newChat);
+  // Native File > New Chat (Cmd/Ctrl+N) and View > Search (Cmd/Ctrl+K) —
+  // main.js's application menu has no renderer state of its own, so it just
+  // pings these channels (see preload.js onMenuNewChat/onMenuSearch).
+  if (aegis.onMenuNewChat) aegis.onMenuNewChat(newChat);
+  if (aegis.onMenuSearch) aegis.onMenuSearch(openMemoryOverlay);
+  // File > Save as… / Export Session… — same "menu pings, renderer acts"
+  // pattern as New Chat/Search above; both call exportSession() with the
+  // format the menu label promised (see main.js buildAppMenu).
+  if (aegis.onMenuExportMarkdown) aegis.onMenuExportMarkdown(() => exportSession('markdown'));
+  if (aegis.onMenuExportJson) aegis.onMenuExportJson(() => exportSession('json'));
+  // aegis:// deep link (main.js sendDeepLinkToWindow) — delivered once the
+  // window has finished loading, so registering it here at boot is in time
+  // for both a cold-launch link and one that arrives while running.
+  if (aegis.onDeepLink) aegis.onDeepLink(handleDeepLink);
+  // Quick launcher "add to chat" push (main.js pushQuickLauncherResult) —
+  // same ping/act split as the channels above.
+  if (aegis.onQuickLauncherPush) aegis.onQuickLauncherPush(handleQuickLauncherPush);
   els.sessionsRefresh.addEventListener('click', loadSessions);
   els.syncNow.addEventListener('click', syncNow);
+  els.sessionsExport.addEventListener('click', () => exportSession('markdown'));
 
   els.apiKeySave.addEventListener('click', saveApiKey);
   els.apiKeyVerify.addEventListener('click', verifyAegisKey);
@@ -1962,6 +2395,20 @@ async function init() {
       saveApiKey();
     }
   });
+
+  els.quickLauncherSave.addEventListener('click', saveQuickLauncherSettings);
+  els.quickLauncherShortcut.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      saveQuickLauncherSettings();
+    }
+  });
+
+  // Tool-approval switch: persist on change (no Save button), repainting from
+  // what the main process stored — see saveConfirmMode.
+  if (els.confirmMode) {
+    els.confirmMode.addEventListener('change', () => saveConfirmMode(els.confirmMode.checked));
+  }
 
   els.composer.addEventListener('submit', (e) => {
     e.preventDefault();
@@ -2009,11 +2456,38 @@ async function init() {
     if (e.key === 'Escape' && overlayOpen()) closeMemoryOverlay();
   });
 
+  // Auto-update banner: `?`-guarded like the memory inspector above, since
+  // the markup is optional and a missing node must never crash boot.
+  if (els.updateBanner && aegis.onUpdateStatus) {
+    aegis.onUpdateStatus(renderUpdateBanner);
+    aegis.updateStatus().then(renderUpdateBanner).catch(() => {});
+
+    els.updateDownloadBtn.addEventListener('click', () => {
+      els.updateDownloadBtn.disabled = true;
+      aegis.downloadUpdate().finally(() => {
+        els.updateDownloadBtn.disabled = false;
+      });
+    });
+
+    // The only place quitAndInstallUpdate is ever called — an explicit user
+    // click. Nothing in this app restarts itself without that.
+    els.updateRestartBtn.addEventListener('click', () => {
+      aegis.quitAndInstallUpdate();
+    });
+
+    els.updateLaterBtn.addEventListener('click', () => {
+      updateDismissedFor = lastUpdateState && lastUpdateState.status;
+      els.updateBanner.hidden = true;
+    });
+  }
+
   // First paint: show the welcome panel unless a session already rendered rows.
   if (!els.messages.querySelector('.msg, .chatflow')) renderWelcome();
 
   await loadClasses();
   await loadSettings();
+  await loadQuickLauncherSettings();
+  await loadConfirmMode();
   await loadSessions();
   await refreshSyncStatus();
   loadAccountInfo();

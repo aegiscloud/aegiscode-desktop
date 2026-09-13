@@ -43,6 +43,35 @@ body {
   font: 14px/1.5 var(--font-display);
 }
 
+/* ----------------------------------------------------------- update banner */
+.update-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 16px;
+  background: var(--surface2);
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  color: var(--text);
+}
+
+/* Same author-stylesheet-beats-UA-stylesheet gotcha as .autonomous-controls
+   below: `display: flex` here outranks `[hidden] { display: none }` from the
+   UA sheet, so the `hidden` attribute was a no-op with no visual effect. That
+   left the banner permanently on screen from first paint — its initial
+   `hidden` in index.html did nothing — and made the "Later" button look dead,
+   since its dismissal only sets `.hidden = true`. This override restores both
+   the initial hidden state and every silent status in renderUpdateBanner. */
+.update-banner[hidden] {
+  display: none;
+}
+
+.update-banner-actions {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+}
+
 /* --------------------------------------------------------------- top bar */
 .topbar {
   display: flex;
@@ -852,6 +881,26 @@ body.memory-open {
   gap: 2px;
 }
 
+/* Extended-reasoning trace for a "work autonomously" turn (streamed as
+   `reasoning` deltas — see renderer/app.js ensureReasoningEl). Deliberation
+   shown above the answer: dimmer and smaller than body copy so it reads as
+   working-out rather than the reply itself. */
+.reasoning {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text2);
+  opacity: 0.85;
+  max-height: 220px;
+  overflow-y: auto;
+  margin-bottom: 8px;
+  padding: 6px 8px;
+  border-left: 2px solid var(--border);
+  background: rgba(255, 255, 255, 0.02);
+}
+
 .meta {
   font-size: 11px;
   color: var(--text2);
@@ -1264,6 +1313,128 @@ label {
   cursor: default;
 }
 
+/* ------------------------------------------------- tool-call approval gate
+   desktop/lib/local/engine.js requestApproval sends an `{ approval }` chunk
+   for every first-time exec/writeFile/editFile call; renderApprovalCard()
+   (renderer/app.js) renders it here, before the call runs. */
+.approval-slot {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.approval-card {
+  border: 1px solid var(--amber);
+  border-radius: 8px;
+  background: rgba(255, 145, 0, 0.08);
+  padding: 8px 10px;
+}
+
+.approval-card.resolved {
+  border-color: var(--border2);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.approval-title {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--amber);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  margin-bottom: 4px;
+}
+
+.approval-card.resolved .approval-title {
+  color: var(--text2);
+}
+
+.approval-summary {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text);
+  word-break: break-word;
+  margin-bottom: 6px;
+}
+
+.approval-diff {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.4;
+  max-height: 220px;
+  overflow-y: auto;
+  overflow-x: auto;
+  white-space: pre;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  margin-bottom: 8px;
+}
+
+.diff-add {
+  color: var(--green);
+}
+
+.diff-del {
+  color: var(--red);
+}
+
+.diff-hunk {
+  color: var(--purple);
+}
+
+.diff-file {
+  color: var(--text2);
+}
+
+.diff-ctx {
+  color: var(--text2);
+}
+
+.approval-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.approval-btn {
+  border-radius: 6px;
+  padding: 4px 10px;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  background: transparent;
+}
+
+.approval-btn.allow {
+  border: 1px solid var(--green);
+  color: var(--green);
+}
+
+.approval-btn.allow-session {
+  border: 1px solid var(--teal);
+  color: var(--teal);
+}
+
+.approval-btn.deny {
+  border: 1px solid var(--red);
+  color: var(--red);
+}
+
+.approval-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.approval-decision {
+  margin-top: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text2);
+}
+
 /* ------------------------------------------------------- settings pane */
 .setting-row {
   border: 1px solid var(--border);
@@ -1451,4 +1622,174 @@ label {
   opacity: 0.55;
   max-width: 460px;
   line-height: 1.6;
+}
+
+/* ------------------------------------------------- rendered markdown (D?)
+   renderer/markdown.js parses assistant text with marked, sanitizes with
+   DOMPurify, then hands the sanitized HTML to .body/.flow-body via
+   innerHTML. md-body opts those containers out of the plain-text
+   `white-space: pre-wrap` (see .body/.flow-body above) so marked's own
+   block elements (p/ul/pre/h1…) supply spacing instead of every inter-tag
+   newline in the generated HTML rendering as a visible blank line. */
+.md-body {
+  white-space: normal;
+}
+
+.md-body p {
+  margin: 0 0 8px;
+}
+
+.md-body p:last-child {
+  margin-bottom: 0;
+}
+
+.md-body ul,
+.md-body ol {
+  margin: 0 0 8px;
+  padding-left: 1.4em;
+}
+
+.md-body li {
+  margin-bottom: 2px;
+}
+
+.md-body h1,
+.md-body h2,
+.md-body h3,
+.md-body h4 {
+  font-family: var(--font-display);
+  line-height: 1.3;
+  margin: 12px 0 6px;
+}
+
+.md-body h1:first-child,
+.md-body h2:first-child,
+.md-body h3:first-child,
+.md-body h4:first-child {
+  margin-top: 0;
+}
+
+.md-body blockquote {
+  margin: 0 0 8px;
+  padding: 2px 10px;
+  border-left: 2px solid var(--border2);
+  color: var(--text2);
+}
+
+.md-body a {
+  color: var(--teal);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.md-body table {
+  border-collapse: collapse;
+  margin: 0 0 8px;
+  font-size: 12px;
+}
+
+.md-body th,
+.md-body td {
+  border: 1px solid var(--border);
+  padding: 4px 8px;
+  text-align: left;
+}
+
+.md-body hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 10px 0;
+}
+
+/* Inline `code` spans, as opposed to fenced ```code blocks``` (below). */
+.md-body :not(pre) > code {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+
+/* Fenced code block, decorated by renderer/markdown.js decorateCodeBlock()
+   with an AegisHighlight-tokenized <code> and a copy button. */
+.code-block {
+  position: relative;
+  margin: 0 0 8px;
+  padding: 10px 12px;
+  padding-top: 26px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow-x: auto;
+}
+
+.code-block code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre;
+  color: var(--text);
+}
+
+.code-copy-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  border: 1px solid var(--border2);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text2);
+  padding: 1px 8px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  cursor: pointer;
+  opacity: 0.7;
+  transition: opacity 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.code-block:hover .code-copy-btn {
+  opacity: 1;
+}
+
+.code-copy-btn:hover {
+  color: var(--teal);
+  border-color: var(--teal);
+}
+
+/* Syntax highlight tokens — vendor/aegis-highlight.js. Kept low-contrast
+   against .code-block's dark background rather than a full editor theme. */
+.tok-comment {
+  color: var(--text3);
+  font-style: italic;
+}
+
+.tok-string {
+  color: var(--green);
+}
+
+.tok-keyword {
+  color: var(--purple);
+  font-weight: 600;
+}
+
+.tok-number {
+  color: var(--amber);
+}
+
+.tok-function {
+  color: var(--teal);
+}
+
+.tok-property,
+.tok-attr {
+  color: var(--purple);
+}
+
+.tok-tag {
+  color: var(--teal);
+}
+
+.tok-variable {
+  color: var(--amber);
 }

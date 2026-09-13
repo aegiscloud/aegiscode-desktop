@@ -46,6 +46,31 @@ queue that flushes on each "Sync now" or heartbeat retry. The **remember**
 button on any assistant reply pins that message to cross-machine memory —
 queued locally if you're offline.
 
+Before `exec`, `writeFile`, or `editFile` runs, a diff/approval card asks you
+to confirm — flip **Settings → "Confirm before running tools"** off if you'd
+rather the agent just run mutating tool calls without asking.
+
+## Keyboard shortcuts
+
+| Shortcut | Action |
+|---|---|
+| `Cmd/Ctrl+N` | New chat |
+| `Cmd/Ctrl+K` | Open search (memory inspector) |
+| `Cmd/Ctrl+S` | Save as… (export the open session as Markdown) |
+| `Cmd/Ctrl+Shift+Space` | Toggle the global quick launcher (configurable in the sidebar's Quick Launcher card) |
+| `Cmd/Ctrl+R` | Reload · `Cmd/Ctrl+Shift+I` | Toggle DevTools |
+
+The quick launcher is a small, frameless, always-on-top prompt window you can
+summon from anywhere on the desktop — even when AEGIS Desktop isn't focused —
+for a fast one-shot answer (no file/shell access, no approval prompts), with
+`Cmd/Ctrl+Enter` to drop the answer into the main window as a new chat turn.
+Packaged builds register the shortcut by default; `npm start` dev runs only
+do if you turn it on in that same sidebar card.
+
+AEGIS Desktop also registers an `aegis://` protocol handler — `aegis://open?session=<id>`
+resumes a saved session, `aegis://new?prompt=<text>` starts a fresh chat with
+that prompt pre-filled.
+
 ## Run from source
 
 ```bash
