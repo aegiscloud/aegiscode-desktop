@@ -465,6 +465,9 @@ function createClient(opts = {}) {
     const decoder = new TextDecoder();
     let buffer = '';
     let fullText = '';
+    // Mirrors fullText for the reasoning channel so a reasoning SNAPSHOT is
+    // deduplicated the same way a content snapshot is.
+    let reasoningText = '';
     let resultModel = body.model;
     let usage = null;
     let sseError = '';
@@ -489,13 +492,26 @@ function createClient(opts = {}) {
     // default Nexus turn (brain model id, checkbox off) dying at 60s — with
     // the server already past its own fan-out deadline and every worker
     // billed. See idleBudgetFor().
+    // The budget is measured from the last real `data:` frame, not from the
+    // last read. SSE keep-alive comments (": keep-alive") are transport
+    // framing, and a stalled upstream can emit them forever: a watchdog armed
+    // per read() is reset by every one of them and so never fires, which is
+    // exactly the hang this guard exists to prevent. Only a parsed payload
+    // moves `lastPayloadAt` below.
     const idleMs = idleBudgetFor(res, idleTimeoutMs);
+    let lastPayloadAt = Date.now();
+    let keepAlives = 0;
     async function readWithIdleTimeout() {
       let timer;
+      const remaining = Math.max(0, idleMs - (Date.now() - lastPayloadAt));
       const timeout = new Promise((_, reject) => {
         timer = setTimeout(() => {
-          reject(new Error(`stream stalled - no data for ${idleMs / 1000}s`));
-        }, idleMs);
+          reject(new Error(
+            keepAlives > 0
+              ? `stream stalled - only keep-alives for ${idleMs / 1000}s`
+              : `stream stalled - no data for ${idleMs / 1000}s`
+          ));
+        }, remaining);
       });
       try {
         return await Promise.race([reader.read(), timeout]);
@@ -520,7 +536,11 @@ function createClient(opts = {}) {
 
       for (const rawLine of lines) {
         const line = rawLine.trim();
-        if (!line.startsWith('data:')) continue;
+        if (!line.startsWith('data:')) {
+          if (line.startsWith(':')) keepAlives++;
+          continue;
+        }
+        lastPayloadAt = Date.now(); // a real frame: the stream is still speaking
         const payload = line.slice(5).trim();
         if (!payload || payload === '[DONE]') continue;
         let json;
@@ -548,24 +568,48 @@ function createClient(opts = {}) {
         // synthesis pass writes the visible answer. Deliberately kept out of
         // `fullText` — deliberation is not an answer, and counting it would
         // make a no-answer turn look answered to every caller's empty-check.
-        const reasoning =
-          (choice &&
-            ((choice.delta && choice.delta.reasoning_content) ||
-              (choice.message && choice.message.reasoning_content))) ||
-          '';
-        if (reasoning) {
-          if (typeof onReasoning === 'function') onReasoning(reasoning);
-          else onStream({ reasoning });
-        }
-        const delta =
-          (choice &&
-            ((choice.delta && choice.delta.content) ||
-              (choice.message && choice.message.content))) ||
-          '';
-        if (delta) {
-          fullText += delta;
-          onStream({ delta });
-        }
+        // `delta.*` is an INCREMENT; `message.*` is a SNAPSHOT of the whole
+        // message so far. Collapsing them with `||` made a stream that ends
+        // with a message snapshot append the entire answer a second time —
+        // the duplicated text in the CLI. They are merged here through one
+        // helper that emits only what the caller has not already seen.
+        const advance = (increment, snapshot, seen, emit) => {
+          if (typeof increment === 'string' && increment) {
+            emit(increment);
+            return seen + increment;
+          }
+          if (typeof snapshot === 'string' && snapshot) {
+            if (!seen) { emit(snapshot); return snapshot; }
+            // The usual shape: the snapshot restates everything streamed so
+            // far, so only the tail is new.
+            if (snapshot.startsWith(seen)) {
+              const tail = snapshot.slice(seen.length);
+              if (tail) emit(tail);
+              return snapshot;
+            }
+            // Disjoint from what was already shown — cannot be reconciled, and
+            // appending it would duplicate. Keep what the caller has seen.
+            return seen;
+          }
+          return seen;
+        };
+
+        reasoningText = advance(
+          choice && choice.delta && choice.delta.reasoning_content,
+          choice && choice.message && choice.message.reasoning_content,
+          reasoningText,
+          (chunk) => {
+            if (typeof onReasoning === 'function') onReasoning(chunk);
+            else onStream({ reasoning: chunk });
+          }
+        );
+
+        fullText = advance(
+          choice && choice.delta && choice.delta.content,
+          choice && choice.message && choice.message.content,
+          fullText,
+          (chunk) => onStream({ delta: chunk })
+        );
         const fragments =
           (choice && choice.delta && choice.delta.tool_calls) ||
           (choice && choice.message && choice.message.tool_calls);
@@ -620,9 +664,19 @@ function createClient(opts = {}) {
     return apiGet('/api/token-bank/balance');
   }
 
-  /** Start a token-bank top-up; resolves to { url } for the payment page. */
+  /** Start a token-bank top-up; resolves to { url } for the payment page.
+   *  aegis1 requires a signed-in account (403/401 without a key) and rejects
+   *  an amount outside 2..1000 EUR with 400. */
   async function tokenBankTopup(amountEur) {
     return apiPost('/api/token-bank/topup', { amount_eur: amountEur });
+  }
+
+  /** Start a plan checkout; resolves to { url } for Stripe's hosted page.
+   *  aegis1 `/api/billing/checkout` is deliberately public (the Stripe page
+   *  collects the email), so this works with no key configured — but answers
+   *  503 `setup_required` while the price id is unset on the server. */
+  async function billingCheckout() {
+    return apiPost('/api/billing/checkout', {});
   }
 
   async function byokStatus() {
@@ -753,6 +807,7 @@ function createClient(opts = {}) {
     listModels,
     tokenBankBalance,
     tokenBankTopup,
+    billingCheckout,
     byokStatus,
     byokSet,
     getMemoryToken,

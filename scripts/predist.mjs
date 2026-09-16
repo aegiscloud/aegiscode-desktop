@@ -22,6 +22,13 @@ const desktop = join(here, '..');
 
 const required = [
   'vendor/aegis.js',
+  // main.js resolves the npm update checker as `../client/update.js` first and
+  // falls back to `./vendor/update.js` inside a bare `catch`. In this repo the
+  // first path can never resolve, so if this file is absent the second require
+  // throws into the same swallow and the app degrades to
+  // `status: 'disabled', error: 'update checker unavailable'` with no build
+  // error — exactly the silent gap that shipped in v0.5.1. Verify it here.
+  'vendor/update.js',
   'vendor/foreign-memory.js',
   // The account credential store and the unified session store. Both are read
   // by all three AEGIS hosts through the same file; the app resolves them from
