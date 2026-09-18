@@ -9,17 +9,49 @@ delegate whole sub-tasks to subagents. It does **not** require Claude Code.
 
 ## Install
 
+Download a build from the
+[releases page](https://github.com/aegiscloud/aegiscode-desktop/releases), or
+install from npm:
+
 ```bash
-npm install -g aegis-desktop
-aegis
+npm install -g aegis-desktop     # requires Node 18+
+aegis                            # launch
 ```
 
+Either way, on first launch:
+
+1. Open **Settings** in the sidebar.
+2. Paste an AEGIS key into the **API key** row — get a free one at
+   <https://aegiscloud.org>. `AEGIS_API_KEY` is picked up from the environment
+   if you would rather not paste it.
+3. Pick a model class from the picker at the bottom of the composer.
+
 The published package is [`aegis-desktop`](https://www.npmjs.com/package/aegis-desktop)
-on npm; this repo is its source.
+on npm; this repo is its source. No AEGIS account is needed for the Ollama or
+custom-endpoint classes.
+
+## Using it
+
+Everything is in the window — there is no slash-command line to learn. Plain
+text in the composer is a prompt.
+
+| Where | What it does |
+|---|---|
+| **Composer** | Type and press `Enter`. `Shift+Enter` for a newline. |
+| **Class picker** | Bottom of the composer — switches the route mid-conversation, context intact. |
+| **Model dropdown** | Next to it — pins a model id for the selected class, or leaves it on "server default (auto)". |
+| **Settings** (sidebar) | API key, provider keys, tool-confirmation toggle. |
+| **Queue card** (sidebar) | The unattended work queue — same file the CLI drains. |
+| **Quick Launcher card** | Enable/rebind the global hotkey. |
+| **remember** (on any reply) | Pin that message to cross-machine cloud memory. |
+
+Approval cards appear inline before `exec`, `writeFile` or `editFile` runs:
+**Allow once**, **Allow for this session**, or **Deny**. Turn them off entirely
+with **Settings → "Confirm before running tools"** — on by default.
 
 ## Model classes
 
-Pick any of four transports from the model-class picker, switchable
+Pick any of five transports from the model-class picker, switchable
 mid-conversation with context intact:
 
 | Class | Transport | Key held in |
@@ -28,10 +60,40 @@ mid-conversation with context intact:
 | **Ollama** | local `ollama` daemon | no key needed |
 | **Custom OpenAI-compatible** (LM Studio, OpenRouter, vLLM, …) | direct from the desktop app | main process — never sent to the renderer |
 | **Anthropic-compatible** (Claude, or any Messages-format gateway) | direct from the desktop app | main process |
+| **Bring your own key** | your provider key, relayed by AEGIS — see below | main process |
 
 Get a free AEGIS key at **https://aegiscloud.org**, or use your own
 Ollama/OpenAI-compatible/Anthropic-compatible endpoint — no AEGIS account
 needed for those.
+
+### Bring your own key (BYOK)
+
+For the providers AEGIS does **not** run in its pool — bring your own key and
+the models that key unlocks appear as their own entries, one per provider.
+
+1. **Settings** → find the row named `BYOK: <Provider>` (OpenAI, Anthropic,
+   DeepSeek, Groq, xAI, Mistral, Gemini, OpenRouter, …).
+2. Paste your provider key and **Save**. There is no base-URL field on these
+   rows: a BYOK turn always talks to AEGIS's own relay
+   (`/api/v1/byok/chat/completions`), which is what attaches your AEGIS key.
+3. Select the **Bring your own key** class and pick a model.
+
+**What it costs.** AEGIS pays your provider nothing on this lane, so there is no
+provider cost to take a margin on — instead your AEGIS account is charged a flat
+**handling fee** per 1k tokens, for the routing, prompt assembly, caching, tool
+bridging and uptime that still happen server-side. The rate is the server's own
+(published on `GET /api/v1/byok/providers`) and is shown in Settings directly
+under the provider rows; it is never hardcoded here, so it cannot drift from the
+ledger that bills you. It is deliberately below the pooled price for the same
+traffic — BYOK stays the cheaper lane, it just is not the free one.
+
+**Two keys are needed.** Your provider key *and* an AEGIS account key: the
+handling fee has to be billed somewhere. With no AEGIS key connected the class
+shows every model but says exactly that, rather than failing opaquely.
+
+Note that a **BYOK turn is single-shot** — the relay takes no `tools` parameter,
+so the agentic tool loop below is off for these models. Use a pooled or direct
+class when you want file and shell access.
 
 ## Tools available to the model
 
@@ -51,6 +113,88 @@ Conversations persist locally and sync to AEGIS cloud memory via a pending
 queue that flushes on each "Sync now" or heartbeat retry. The **remember**
 button on any assistant reply pins that message to cross-machine memory —
 queued locally if you're offline.
+
+## Autonomous queue
+
+The unattended work queue, shared with the CLI: tasks are appended to
+`~/.aegiscode/queue.jsonl` and drained later, one at a time, with tool approval
+**disabled** — there is nobody there to click an approval card. The desktop
+sidebar's queue card and `aegiscode autonomous` are two views of the same file.
+
+```bash
+aegiscode autonomous add "fix the flaky retry test" --cwd ~/repo --commit
+aegiscode autonomous list
+aegiscode autonomous run                 # drain one task, then stop
+aegiscode autonomous proceed --max 3     # drain up to three
+aegiscode autonomous reconcile --auto    # queue the next unfinished PLAN.md phase, then drain it
+aegiscode autonomous retry <id>          # put a finished task back
+aegiscode autonomous clear --all         # empty the queue
+```
+
+A task's text is stored verbatim — `add "fix --json in the parser"` is a task,
+not a flag. Drains commit only the paths that task's own tool layer wrote, so a
+drain never sweeps a peer's in-flight edits into your commit.
+
+### Aegis Cloud only
+
+A queued task runs on the pooled brain — **`nexus-brain`** (alias
+`aegis-brain`) — for the same reason the Claude Code plugin is cloud-only: the
+queue hands work to a loop with no human in it, and the pooled class is the one
+the server can route, budget, and bill on its own. A task that *states* another
+model id is refused where you can still see it, instead of failing minutes into
+a drain as an opaque server error:
+
+| Where the model was stated | What happens |
+|---|---|
+| `autonomous add --model <id>` | refused, with the reason, at add time — nothing is queued |
+| A hand-edited `queue.jsonl` | refused pre-flight by the worker (`ms: 0`), before any turn is billed |
+| `AEGIS_MODEL=<id>` in the environment | **ignored for queue runs**, and reported as a note — that variable is shared with the interactive surfaces, which *do* run direct providers |
+| nothing stated | `nexus-brain` |
+
+### What a queued task costs
+
+The queue has two shapes, and the cheap one is the default:
+
+| | Single pass (default) | Fan-out (opt in) |
+|---|---|---|
+| Provider calls | 1 | `workers` + 1 (investigation passes, then synthesis) |
+| Effort rung | `medium` | `high` |
+| How to ask for it | nothing — it is the default | `AEGIS_AUTONOMOUS_FANOUT=1` |
+
+An earlier version sent **every** queued task as a fan-out at the priciest rung:
+one queued line could become several reasoning calls plus a synthesis, all at
+`high`. Making the fan-out opt-in, and letting effort follow the shape of the
+task rather than always topping out, removes the worker multiplication and
+roughly halves the budget on a one-line task. `--effort` (or
+`AEGIS_AUTONOMOUS_EFFORT`) still wins outright, and `--workers N` is only sent
+when you are actually fanning out.
+
+> **Known gap:** there is no `--fanout` flag yet — the opt-in is the environment
+> variable or `singlePass: false` in the task record. `--single-pass` still
+> parses, but it now agrees with the default instead of overriding it.
+
+### A turn that runs out of rounds keeps its work
+
+The tool loop runs against a round horizon: 24 rounds for an interactive turn
+(`AEGIS_CHAT_MAX_ROUNDS`), 40 for a queued one
+(`AEGIS_AUTONOMOUS_MAX_ROUNDS`). A model that reached it mid-turn used to lose
+everything it had assembled, because the cap was *turn* state.
+
+The horizon is now **session state**, held in `lib/local/session-rounds.js`. When
+a turn stops at the cap the interruption is filed against the session, and the
+next message in that conversation is prefixed with a continuation preamble —
+*cut off after N tool rounds; continue, do not restart* — along with
+`max(4, ⌈horizon/4⌉)` extra rounds so re-orientation does not eat the new
+horizon. The resume is announced in the transcript, so it is visible rather
+than silent.
+
+- In-memory and **process-local** (30-minute TTL, 64 entries) — it never leaves
+  the process and never touches disk.
+- Claiming an entry **consumes** it: one resume per interruption, so a chain of
+  interruptions is a chain of deliberate asks, never an automatic loop.
+- A **stated** horizon always wins; the ledger only pads its own default.
+- A caller that mints a fresh session key every turn adopts the most recent held
+  entry (bounded to 10 minutes) instead of losing the work.
 
 ## Keyboard shortcuts
 
@@ -102,32 +246,19 @@ The app registers an `aegis://` protocol handler:
 | `aegis://open?session=<id>` | Resumes a saved session |
 | `aegis://new?prompt=<text>` | Starts a fresh chat with that prompt pre-filled |
 
-## Token usage display
-
-Every assistant turn reports what it consumed and what it cost. The count is
-the **whole turn**, not just the last model reply — a single turn issues one
-billed provider call per tool round, so the engine sums usage across every
-round (including the truncation retry, the synthesis re-dispatch, and any
-subagents) and the footer shows that total.
-
-Counter normalisation happens in `renderer/usage.js` (the display mapping,
-unit-tested in the upstream monorepo) and in the vendored transport, because
-the wire spellings differ per provider:
-
-| Provider class | What the wire reports |
-|---|---|
-| Aegis Cloud (Nexus) | OpenAI-style SSE. The stream only carries `usage` when the request asks for it (`stream_options.include_usage`), so the client sets that on streaming calls and retries without it — still streamed — if a server rejects the flag. |
-| OpenAI-compatible | `prompt_tokens` / `completion_tokens` / `total_tokens` |
-| Anthropic-compatible | Anthropic splits usage across two SSE events: `message_start` carries the input side, `message_delta` carries a cumulative output side and **no** input side. Both halves are merged, and cache-read/creation tokens are folded into the prompt total so a cached turn doesn't read as free. |
-
-If a provider genuinely returns no usage, the row stays blank rather than
-showing a misleading `0 tokens`.
-
 ## Run from source
 
 ```bash
 git clone https://github.com/aegiscloud/aegiscode-desktop.git
 cd aegiscode-desktop
+npm install
+npm start
+```
+
+Or, from the monorepo checkout, run this directory directly:
+
+```bash
+cd aegiscode-plugin/desktop
 npm install
 npm start
 ```
@@ -139,14 +270,11 @@ npm run dist        # packaged app (AppImage / MSI+NSIS / dmg)
 npm run dist:dir    # unpacked dir, for quick testing
 ```
 
-Targets: Windows (NSIS `.exe` + `.msi`), macOS (`.dmg`), Linux (`AppImage`) —
-see `electron-builder.yml`. Artifacts are currently **unsigned** (Windows
-Authenticode via SignPath Foundation is pending — see `SIGNING.md`).
-
 ## Checks
 
 ```bash
-npm run check   # node --check every main-process + renderer file
+npm run check                    # node --check every main-process + renderer file
+node ../test/desktop-shell.mjs   # headless IPC smoke test (no Electron binary needed)
 ```
 
 ## Structure
@@ -156,18 +284,21 @@ main.js              Electron main process — window + IPC shell only
 preload.js           Context-isolated IPC bridge exposed to the renderer
 renderer/            UI (vanilla JS, no framework)
 lib/local/           Model classes, providers, agentic tool loop, prompt
+lib/local/queue.js   The shared work queue (~/.aegiscode/queue.jsonl)
+lib/local/autonomous.js  The unattended worker — directive, digest, commits
+lib/local/session-rounds.js  Session-scoped tool-round ledger (in-memory)
 lib/sync/            Local session/memory persistence + sync queue
 vendor/aegis.js      The AEGIS transport client (thin — no engine logic)
 bin/aegis.js         `aegis` CLI entry point for the global npm install
 ```
 
-`vendor/aegis.js` is a vendored copy of the shared transport client also used
-by the [AEGIS Code](https://github.com/aegisinfo/aegiscode-plugin) Claude Code
-plugin and CLI — same wire format, no engine/routing/tier logic on this side
-of the network boundary. This repo is a `git subtree split` of that
-monorepo's `desktop/` — architecture notes, tests, and the Claude Code plugin
-surface live there.
-
-## License
-
-MIT
+This repo is a `git subtree split` of the `desktop/` directory of the
+[aegiscode-plugin](https://github.com/aegisinfo/aegiscode-plugin) monorepo,
+which also ships a Claude Code plugin and the shared transport client over the
+same AEGIS backend. That monorepo is the source of truth: edits land there and
+are synced here, nothing is authored in this repo. Architecture notes, tests,
+and the terminal host
+([cli/README.md](https://github.com/aegisinfo/aegiscode-plugin/blob/main/cli/README.md))
+live there. The npm package
+[`aegis-desktop`](https://www.npmjs.com/package/aegis-desktop) is built from
+this repo.
