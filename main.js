@@ -39,7 +39,7 @@ const { createClient } = sharedClient;
 // The shared credential store (`client/credentials.js`) — the same 0600 file
 // the terminal host writes with `aegiscode login` and the MCP plugin reads. The
 // app resolves its own account key through it, so signing in once serves all
-// three hosts; see resolveStartupKey() and persistApiKey() below.
+// four hosts; see resolveStartupKey() and persistApiKey() below.
 let credentials;
 try {
   credentials = require('../client/credentials.js');
@@ -66,6 +66,7 @@ const ollama = require('./lib/local/ollama.js');
 const providers = require('./lib/local/providers.js');
 const sessionStore = require('./lib/sync/sessions.js');
 const memoryQueue = require('./lib/sync/memory-queue.js');
+const persistGate = require('./lib/sync/persist-gate.js');
 const windowState = require('./lib/window-state.js');
 const deepLink = require('./lib/deep-link.js');
 const quickLauncherLib = require('./lib/quick-launcher.js');
@@ -85,11 +86,19 @@ try {
 // sandbox note on registerToolsIpc().
 const localTools = require('./lib/local/tools.js');
 
+// The local autonomous work queue (commit 96fb64f): a durable task list plus
+// the unattended worker that drives the local engine's tool loop. MAIN-process
+// only, like the tool executor above — the renderer reaches it solely through
+// the `queue:` IPC surface registered by registerQueueIpc() below.
+const queueModule = require('./lib/local/queue.js');
+const autonomousModule = require('./lib/local/autonomous.js');
+
 const IPC_PREFIX = 'aegis:';
 const MODEL_PREFIX = 'model:';
 const SYNC_PREFIX = 'sync:';
 const TOOLS_PREFIX = 'tools:';
 const QUICK_PREFIX = 'quick:';
+const QUEUE_PREFIX = 'queue:';
 
 /**
  * Main -> renderer push channel for chat SSE deltas (D2.1 streaming render).
@@ -125,6 +134,36 @@ const DEEP_LINK_CHANNEL = `${IPC_PREFIX}deepLink`;
  * MENU_NEW_CHAT_CHANNEL etc. — this just delivers the payload.
  */
 const QUICK_LAUNCHER_PUSH_CHANNEL = `${IPC_PREFIX}quickLauncherPush`;
+
+/**
+ * Main -> renderer push for a queue drain's progress (one event per turn frame:
+ * start/tool/delta/finish, plus recovered/queued/locked). Deliberately its OWN
+ * channel rather than CHAT_DELTA_CHANNEL.
+ *
+ * A drain runs an unattended turn in a repository, and every one of its frames
+ * is about that task — its tool calls, its output, its cost. Pushed onto the
+ * chat delta channel they would be typed into whatever conversation the user
+ * happens to have open (the preload's sessionId filter would have to be widened
+ * to let them through at all), so the transcript would grow a second, unattached
+ * answer nobody asked for. The queue is not a chat surface: the renderer shows
+ * state and outcomes from this event, and the transcript stays clean.
+ */
+const QUEUE_PROGRESS_CHANNEL = `${QUEUE_PREFIX}progress`;
+
+/**
+ * How much task text the queue surface accepts, and how many rounds a queued
+ * task may take. Both are ceilings on what ONE renderer call can ask the app to
+ * spend: without them a pasted file would be queued as a task (every round
+ * re-sends the prompt) and a task could pin the loop open indefinitely.
+ * `workers` is capped at 8 to match the Model card's own input.
+ */
+const QUEUE_MAX_TASK_CHARS = 8000;
+const QUEUE_MAX_ROUNDS = 200;
+const QUEUE_MAX_WORKERS = 8;
+
+/** The efforts the queue accepts; anything else means "let the worker decide"
+ *  (autonomous.js resolveEffort, whose default is high for unattended work). */
+const QUEUE_EFFORTS = new Set(['low', 'medium', 'high']);
 
 /**
  * Address one SSE delta to the stream that produced it (D2.2 multi-stream).
@@ -193,6 +232,53 @@ function upgradeInfo(err) {
 /** Message text for a failure, without assuming the Error shape. */
 function errorText(err) {
   return err && err.message ? err.message : String(err);
+}
+
+/**
+ * Precise classification of a cloud-sync refusal — the desktop port of
+ * `describeError()` in cli/src/cloudsync.js, so both hosts name a 402/401 the
+ * same way instead of surfacing whatever sentence the server happened to use.
+ *
+ * `push()`/`pull()` used to hand the renderer `err.message` alone, so a
+ * per-session memory-token 401 or a 402 reached the banner as
+ * "sync failed: free_session_limit_reached" — a string that reads like a bug
+ * and names no fix. The shared client attaches `err.status` / `err.data`
+ * (vendor/aegis.js parseResponse) while the error is still in main, which is
+ * why the classification happens here.
+ *
+ * `kind` is `quota` | `auth` | `error`; `hint` is the actionable half of the
+ * sentence (what to do about it), null when there is nothing to say.
+ */
+function describeSyncError(err) {
+  const status =
+    (err && (err.status || (err.response && err.response.status))) || 0;
+  const message = errorText(err);
+  // upgradeInfo() already knows the cap: either a 402 or the server's
+  // `free_session_limit_reached` code (an older body without a status).
+  if (upgradeInfo(err)) {
+    return {
+      kind: 'quota',
+      status: status || 402,
+      message,
+      hint:
+        "the plan's synced-token ceiling is reached — free space in the account dashboard or upgrade to keep syncing",
+    };
+  }
+  if (status === 401) {
+    return {
+      kind: 'auth',
+      status,
+      message,
+      hint: 'the memory token was refused — re-enter your AEGIS API key to exchange a new one',
+    };
+  }
+  return { kind: 'error', status: status || null, message, hint: null };
+}
+
+/** The banner line for a classified failure: the server's words + the fix. */
+function syncErrorReason(info) {
+  if (!info) return 'sync failed';
+  return info.hint ? `${info.message} — ${info.hint}` : info.message;
 }
 
 /**
@@ -744,6 +830,62 @@ function createEngine(aegis, { app, safeStorage, dir: dirOverride, sessionsDir: 
   return { engine, sessionsDir, settingsDir, settings };
 }
 
+/** Largest pre-edit read the diff bridge will hand the renderer (bytes). */
+const PREVIEW_READ_MAX_BYTES = 512 * 1024;
+
+/**
+ * The contained, capped read behind the renderer's diff preview — the only
+ * filesystem capability the renderer has, and the narrowest form of it.
+ *
+ * The renderer supplies a file plus the cwd of the session it is displaying.
+ * Every path is resolved with `realpath` *before* the containment test, so a
+ * symlink planted inside the workspace cannot point the read outside it, and
+ * containment is judged with `path.relative` rather than a `startsWith` prefix
+ * (which would let `/home/neo-evil` pass a naive `/home/neo` check). Anything
+ * refused — relative cwd, escape, missing file, directory, non-regular file —
+ * returns null, which degrades the preview to a create-style diff instead of
+ * throwing onto the render path.
+ *
+ * @returns {{text: string, truncated: boolean}|null}
+ */
+function readTextFileForPreview(payload) {
+  try {
+    const file = payload && typeof payload.file === 'string' ? payload.file : '';
+    const cwd = payload && typeof payload.cwd === 'string' ? payload.cwd : '';
+    if (!file || !cwd || !path.isAbsolute(cwd)) return null;
+
+    // realpath both sides: resolving the root too keeps this correct on hosts
+    // where the workspace itself is reached through a symlink (/tmp, /var).
+    const root = fs.realpathSync(cwd);
+    const abs = fs.realpathSync(path.resolve(root, file));
+    const rel = path.relative(root, abs);
+    if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) return null;
+
+    const st = fs.statSync(abs);
+    if (!st.isFile()) return null;
+
+    if (st.size <= PREVIEW_READ_MAX_BYTES) {
+      return { text: fs.readFileSync(abs, 'utf8'), truncated: false };
+    }
+    // Oversized: read only the head of the file and cut back to the last
+    // newline, so a byte-boundary truncation cannot leave a half-decoded
+    // multi-byte sequence at the end of the preview.
+    const fd = fs.openSync(abs, 'r');
+    try {
+      const buf = Buffer.alloc(PREVIEW_READ_MAX_BYTES);
+      const n = fs.readSync(fd, buf, 0, PREVIEW_READ_MAX_BYTES, 0);
+      let text = buf.toString('utf8', 0, n);
+      const nl = text.lastIndexOf('\n');
+      if (nl > 0) text = text.slice(0, nl + 1);
+      return { text, truncated: true };
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Pure mapping: model:<name> -> LocalEngine call (unit-testable in Node).
  */
@@ -764,6 +906,14 @@ function createModelDispatch(engine) {
       }),
     'settings.remove': (payload) =>
       engine.settings.remove(payload && payload.provider),
+    // Persisting memory ("sync finished turns to cloud memory automatically").
+    // Reserved namespace, so it is invisible to the provider CRUD above — but
+    // unlike a provider it IS reachable deliberately, through these two. The
+    // gate that enforces it lives in lib/sync/persist-gate.js and reads the
+    // same file, so a `false` written here stops the next automatic push.
+    'memoryPersist.get': () => engine.settings.memoryPersistState(),
+    'memoryPersist.set': (payload) =>
+      engine.settings.setMemoryPersist(Boolean(payload && payload.enabled)),
     cancel: (payload) => engine.cancel(payload && payload.sessionId),
     // Tool-call approval gate (desktop/lib/local/engine.js gatedExecuteTool):
     // the renderer's approval card answers a pending exec/writeFile/editFile
@@ -784,7 +934,7 @@ function createModelDispatch(engine) {
  * resolve `{ ok: false, reason }` without ever throwing, and every local
  * flow (save/append/list) keeps working untouched.
  */
-function createSyncDispatch(sessions, dir, aegis) {
+function createSyncDispatch(sessions, dir, aegis, settingsDir) {
   let lastSyncAt = null;
 
   function hasCloud() {
@@ -841,6 +991,7 @@ function createSyncDispatch(sessions, dir, aegis) {
 
     let pushed = 0;
     let lastError = null;
+    let lastInfo = null;
     for (const session of pending) {
       try {
         const result = await aegis.conversationSyncPush({
@@ -853,25 +1004,48 @@ function createSyncDispatch(sessions, dir, aegis) {
         pushed += 1;
       } catch (err) {
         lastError = err;
+        lastInfo = describeSyncError(err);
+        // A cap (402) or a refused memory token (401) fails identically for
+        // every later session — same reason the CLI stops there. One request
+        // per queued transcript against a refusal that cannot succeed is
+        // nothing but noise, so stop. The rest are left untouched (markSynced
+        // is never reached for them) and drain after the account is fixed.
+        if (lastInfo.kind === 'quota' || lastInfo.kind === 'auth') break;
       }
     }
     const queued = sessions.listPending(dir).length;
     if (pushed) lastSyncAt = Date.now();
+    // The session push is the path that hits the free-plan cap most often —
+    // every queued transcript re-bills the synced-token ceiling — so its
+    // upgrade metadata wins over the memory flush's. Without this, a capped
+    // session push answered `upgrade: null` and the renderer's capNotice()
+    // (the one place the paywall is visible) never fired.
+    const sessionUpgrade = lastError ? upgradeInfo(lastError) : null;
+    const upgrade = sessionUpgrade || memoryFlush.upgrade;
     if (pushed === 0 && lastError) {
       return {
         ok: false,
         queued,
-        reason: lastError.message || 'push failed',
+        reason: syncErrorReason(lastInfo),
+        // Additive: the renderer reads ok/queued/reason/upgrade exactly as
+        // before; these name the refusal without string-matching its wording.
+        failed: lastInfo ? [lastInfo] : [],
+        kind: lastInfo ? lastInfo.kind : 'error',
+        status: lastInfo ? lastInfo.status : 0,
+        hint: lastInfo ? lastInfo.hint : null,
         memoryFlushed: memoryFlush.flushed,
-        upgrade: memoryFlush.upgrade,
+        upgrade,
       };
     }
     return {
       ok: true,
       queued,
       pushed,
+      // A partially failed push is still `ok` (the ones that went out are
+      // synced), but the reason is carried so nothing looks silently clean.
+      failed: lastInfo ? [lastInfo] : [],
       memoryFlushed: memoryFlush.flushed,
-      upgrade: memoryFlush.upgrade,
+      upgrade,
     };
   }
 
@@ -883,13 +1057,41 @@ function createSyncDispatch(sessions, dir, aegis) {
       const data = await aegis.conversationSyncPull();
       const merged = sessions.mergeRemoteSessions(dir, (data && data.sessions) || []);
       lastSyncAt = Date.now();
-      return { ok: true, merged };
+      return { ok: true, merged, failed: [], upgrade: null };
     } catch (err) {
-      return { ok: false, merged: 0, reason: err && err.message ? err.message : String(err) };
+      const info = describeSyncError(err);
+      // Same shape as cli/src/cloudsync.js pull(): a classified `failed[]`
+      // instead of a bare message to string-match, plus the cap metadata when
+      // this was a 402 — the renderer's syncNow() reads `pullResult.upgrade`
+      // alongside the push's, so a pull that hits the cap now lights the
+      // upgrade banner too.
+      return {
+        ok: false,
+        merged: 0,
+        reason: syncErrorReason(info),
+        failed: [info],
+        kind: info.kind,
+        status: info.status,
+        hint: info.hint,
+        upgrade: upgradeInfo(err),
+      };
     }
   }
 
+  // The automatic post-turn push (persisting memory for every account). Gated
+  // by the `__memoryPersist` preference in settings.json, which the Settings
+  // pane writes through the memoryPersist:* IPC below; the gate is read from
+  // disk in the main process so the renderer cannot push past it. This must
+  // read `settingsDir` (Electron's userData path), NOT `dir` — `dir` here is
+  // the shared aegisHome() sessions/credentials directory, a different path
+  // from userData in a real install, and the settings store is created with
+  // `settingsDir`. Falling back to `dir` only covers callers (tests) that
+  // never pass `settingsDir` and use one directory for everything.
+  const autoPush = persistGate.createAutoPush({ push, dir: settingsDir || dir });
+
   return {
+    auto: () => autoPush.auto(),
+    memoryPersistState: () => autoPush.gate(),
     listSessions: () => ({ sessions: sessions.listSessions(dir) }),
     open: (payload) => sessions.getSession(dir, payload && payload.sessionId),
     save: (payload) => sessions.upsertSession(dir, payload || {}),
@@ -912,6 +1114,88 @@ function createSyncDispatch(sessions, dir, aegis) {
   };
 }
 
+/** First retry delay and the ceiling for the heartbeat push backoff. */
+const HEARTBEAT_RETRY_BASE_MS = 5000;
+const HEARTBEAT_RETRY_MAX_MS = 30000;
+
+/**
+ * Backoff for the fire-and-forget heartbeat push (plan §7 "retry on a
+ * heartbeat"). `model:listModels` and `sync:status` each fire one, and the
+ * renderer polls both — so a permanently failing push (offline, refused
+ * memory token, free-plan cap) used to burn a request on every single one,
+ * forever, with `.catch(() => {})` swallowing the reason.
+ *
+ * Now: exponential backoff from `baseMs` to `maxMs`, reset on success, and the
+ * last error is retained (`state()`) so a stuck sync is visible on the
+ * sync:status payload instead of disappearing into an empty catch.
+ *
+ * `push` is expected to resolve a `{ ok:false, reason }` result rather than
+ * throw (that is createSyncDispatch's contract) — both are counted, because
+ * only counting throws would leave the offline case retrying every heartbeat.
+ * `now`/`baseMs`/`maxMs` are injectable so the tests can drive the ladder
+ * without sleeping.
+ */
+function createHeartbeatRetry(push, opts = {}) {
+  const now = typeof opts.now === 'function' ? opts.now : () => Date.now();
+  const baseMs = Number(opts.baseMs) > 0 ? Number(opts.baseMs) : HEARTBEAT_RETRY_BASE_MS;
+  const maxMs = Number(opts.maxMs) > 0 ? Number(opts.maxMs) : HEARTBEAT_RETRY_MAX_MS;
+  let failures = 0;
+  let nextAttemptAt = 0;
+  let lastError = null;
+  let inFlight = false;
+
+  /** 5s, 10s, 20s, 30s, 30s… — capped, never unbounded. */
+  const delayFor = () => Math.min(maxMs, baseMs * 2 ** Math.max(0, failures - 1));
+
+  function fail(reason) {
+    failures += 1;
+    const wait = delayFor();
+    lastError = reason || 'push failed';
+    nextAttemptAt = now() + wait;
+    return { attempted: true, ok: false, error: lastError, failures, retryInMs: wait };
+  }
+
+  async function run() {
+    const t = now();
+    if (failures > 0 && t < nextAttemptAt) {
+      // Backing off: no request, no state change — the caller keeps whatever
+      // reason is already on record.
+      return { attempted: false, ok: false, error: lastError, failures, retryInMs: nextAttemptAt - t };
+    }
+    if (inFlight) {
+      return { attempted: false, ok: false, error: lastError, failures, retryInMs: 0 };
+    }
+    inFlight = true;
+    try {
+      const result = await push();
+      if (result && result.ok === false) {
+        return fail(result.reason || result.kind || 'push failed');
+      }
+      // Success resets the ladder: the next heartbeat goes straight out.
+      failures = 0;
+      nextAttemptAt = 0;
+      lastError = null;
+      return { attempted: true, ok: true, error: null, failures: 0, retryInMs: 0, result };
+    } catch (err) {
+      return fail(errorText(err));
+    } finally {
+      inFlight = false;
+    }
+  }
+
+  /** Snapshot for the renderer: what failed and how long until the retry. */
+  function state() {
+    const t = now();
+    return {
+      failures,
+      lastError,
+      retryInMs: failures > 0 && nextAttemptAt > t ? nextAttemptAt - t : 0,
+    };
+  }
+
+  return { run, state, recordFailure: (err) => fail(errorText(err)) };
+}
+
 /**
  * Register model:<name> and sync:<name> on ipcMain. `model:chat` is always
  * streaming: deltas are pushed over CHAT_DELTA_CHANNEL exactly like the
@@ -922,18 +1206,33 @@ function createSyncDispatch(sessions, dir, aegis) {
  * `model:listModels` and `sync:status` also fire a background retry push of
  * any pending sessions (plan §7 "retry on a heartbeat"): fire-and-forget,
  * never awaited, never throws — it just gives queued sessions another
- * chance to sync without a dedicated poller.
+ * chance to sync without a dedicated poller. The retry is rate-limited by
+ * createHeartbeatRetry (exponential backoff, reset on success); its last error
+ * rides along on the sync:status result so the renderer can show it.
  *
  * `onReplyFinished`, like the identical param on registerIpc, is
  * bootstrap()-only — it fires the native "reply ready" notification when the
  * window is unfocused/hidden and is never set in the headless test path.
+ * `heartbeatOpts` ({ now, baseMs, maxMs }) is for tests only. `settingsDir`
+ * is Electron's userData path — where settings.json (and so the
+ * `__memoryPersist` preference the auto-push gate reads) actually lives;
+ * `sessionsDir` is the separate shared aegisHome() directory and must not be
+ * used for that gate. Falls back to `sessionsDir` for callers that don't pass
+ * it, i.e. tests that use one directory for everything.
  */
-function registerModelIpc(ipcMain, engine, sessionsDir, aegis, onReplyFinished) {
+function registerModelIpc(ipcMain, engine, sessionsDir, aegis, onReplyFinished, heartbeatOpts, settingsDir) {
   const modelDispatch = createModelDispatch(engine);
-  const syncDispatch = createSyncDispatch(sessionStore, sessionsDir, aegis);
+  const syncDispatch = createSyncDispatch(sessionStore, sessionsDir, aegis, settingsDir);
+
+  const heartbeat = createHeartbeatRetry(() => syncDispatch.push(), heartbeatOpts);
 
   function heartbeatRetry() {
-    syncDispatch.push().catch(() => {});
+    // run() classifies its own failures, so this catch is a last-resort guard
+    // (never an empty swallow): the reason is recorded for the banner either way.
+    const attempt = heartbeat.run();
+    if (attempt && typeof attempt.catch === 'function') {
+      attempt.catch((err) => heartbeat.recordFailure(err));
+    }
   }
 
   for (const [name, handler] of Object.entries(modelDispatch)) {
@@ -971,18 +1270,410 @@ function registerModelIpc(ipcMain, engine, sessionsDir, aegis, onReplyFinished) 
     ipcMain.handle(`${MODEL_PREFIX}${name}`, (_event, payload) => handler(payload));
   }
 
+  // Diff-preview pre-edit read (preload.js `readTextFile`). Registered with
+  // `on` + `event.returnValue`, NOT `handle`: the bridge is `sendSync` because
+  // editPreview consumes its reader synchronously and cannot await an invoke
+  // promise, and `sendSync` is answered only by an `ipcMain.on` listener.
+  // Putting it in modelDispatch above would register a `handle` that sendSync
+  // never reaches. Fires on every edit tool's run frame, so the refusal path
+  // is the common case (a `writeFile` creating a new file) and must stay cheap.
+  ipcMain.on(`${MODEL_PREFIX}readTextFile`, (event, payload) => {
+    event.returnValue = readTextFileForPreview(payload);
+  });
+
   for (const [name, handler] of Object.entries(syncDispatch)) {
     if (name === 'status') {
       ipcMain.handle(`${SYNC_PREFIX}${name}`, (_event, payload) => {
         heartbeatRetry();
-        return handler(payload);
+        const result = handler(payload);
+        // Additive: `retry` carries the last heartbeat failure and the wait
+        // until the next attempt, so a stuck sync is visible instead of
+        // swallowed. The local status fields are untouched.
+        return result && typeof result === 'object'
+          ? { ...result, retry: heartbeat.state() }
+          : result;
       });
       continue;
     }
     ipcMain.handle(`${SYNC_PREFIX}${name}`, (_event, payload) => handler(payload));
   }
 
-  return { modelDispatch, syncDispatch };
+  return { modelDispatch, syncDispatch, heartbeat };
+}
+
+// ─────────────────────────── the local autonomous work queue ───────────────
+//
+// `desktop/lib/local/queue.js` (the durable queue) and
+// `desktop/lib/local/autonomous.js` (the worker that drives the engine's tool
+// loop) shipped with no host using them. This is the desktop host's half: a
+// `queue:` IPC surface, a settings-independent engine for the worker, and the
+// one rule that makes the whole thing safe to leave in a GUI — NOTHING DRAINS
+// UNLESS THE USER ASKED. There is no interval, no drain at startup, and no
+// drain-on-idle anywhere in this file. Draining is spend (a full tool loop on a
+// real model, in the user's checkout); a queue that starts itself when the
+// window is left alone is a feature nobody consented to, so the only callers of
+// `drain`/`proceed` are the two buttons on the renderer's queue card.
+
+/**
+ * A local engine for the queue worker: the same tool loop the interactive chat
+ * runs, with the tool-approval gate hard OFF.
+ *
+ * The gate exists to ask a human before exec/writeFile/editFile. A queued task
+ * is unattended BY DEFINITION — there is nobody to click — and engine.js's
+ * requestApproval() resolves only on a click or on an abort, so a gated engine
+ * here would mean a worker parked on an approval card forever (a `running`
+ * queue item, a held lock, and no record of why). Gate off is the honest
+ * configuration: the worker runs the tools it was asked to run, and the
+ * renderer's card says so in as many words.
+ */
+function createQueueEngine(aegis, settings) {
+  return createLocalEngine({
+    aegis,
+    settings,
+    ollama,
+    providers,
+    getConfirmMode: () => false,
+  });
+}
+
+/**
+ * The second net under createQueueEngine's gate-off engine.
+ *
+ * If an approval request still reaches a drain — a caller that wired the
+ * interactive engine by mistake, or a future engine change — answer it here
+ * rather than leave a card nobody can click. The answer is always 'deny': a
+ * queued task may decide to run the tools it was configured to run, but it may
+ * never silently grant a permission the user reserves for a click. Denying lets
+ * the turn continue to its own conclusion, where autonomous.js — which watches
+ * the same `{ approval }` frame — settles the task as failed with the reason
+ * written down. A hang would have recorded nothing at all.
+ */
+function queueEngineWithDeniedApprovals(engine) {
+  if (!engine || typeof engine.chat !== 'function') return engine;
+  const deny = (chunk) => {
+    const approval = chunk && chunk.approval;
+    if (!approval || !approval.id) return;
+    if (typeof engine.respondApproval !== 'function') return;
+    try {
+      engine.respondApproval(approval.id, 'deny');
+    } catch {
+      /* the turn's own error path reports a gate that cannot be answered */
+    }
+  };
+  return {
+    ...engine,
+    chat(payload, onDelta) {
+      return engine.chat(payload, (chunk) => {
+        deny(chunk);
+        if (typeof onDelta === 'function') onDelta(chunk);
+      });
+    },
+  };
+}
+
+/** True when `p` is an existing directory (the only path check this surface
+ *  makes: a task's cwd is where its tool loop runs, so a typo there has to be
+ *  refused now rather than fail minutes later inside a turn's output). */
+function isExistingDir(p) {
+  try {
+    return fs.statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/** An integer within [min,max], or null for "not stated". */
+function clampInt(value, min, max) {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < min || n > max) return null;
+  return n;
+}
+
+/**
+ * Pure mapping: `queue:<name>` -> queue.js + autonomous.js. Unit-testable in
+ * plain Node with a stub engine and a temp AEGIS_QUEUE_FILE, exactly like
+ * createIpcDispatch/createExportDispatch above — `engine` is injected (the
+ * real one comes from createQueueEngine in bootstrap()), and every path the
+ * queue touches comes from `env`.
+ *
+ * The methods are thin: `enqueue`/`retry`/`remove`/`clear` are the queue file's
+ * own vocabulary, and `drain`/`proceed` are one and many `worker.proceed({max:
+ * 1})` ticks. The worker itself owns the lock, the digest, the round horizon
+ * and the settle-back-into-the-file write; none of that is re-implemented here.
+ *
+ * `stop` is the renderer's Stop button. It has to be its own method rather than
+ * "cancel the current turn": cancelling a turn leaves the next pending task to
+ * start immediately, which is not what a user who just pressed Stop asked for.
+ */
+function createQueueDispatch({
+  engine,
+  env = process.env,
+  queue = queueModule,
+  autonomous = autonomousModule,
+  log = () => {},
+} = {}) {
+  if (!engine || typeof engine.chat !== 'function') {
+    throw new Error('createQueueDispatch: a local engine with chat() is required');
+  }
+
+  // The task the current drain is working, learned from the worker's own
+  // start/finish frames, so `stop` can cancel the turn actually in flight.
+  let running = null;
+  // Set by `stop`, read between ticks by drainAll. Reset when a drain starts.
+  let stopRequested = false;
+  // This window's drain. queue.js's file lock is what stops a SECOND process;
+  // this flag stops a second click in the same window from queueing up a second
+  // loop (which would only be refused by the lock after a round trip).
+  let draining = false;
+
+  const emit = (event) => {
+    if (event && event.type === 'start') running = event.taskId;
+    if (event && event.type === 'finish') running = null;
+    log(event);
+  };
+
+  const worker = autonomous.createQueueWorker({
+    engine: queueEngineWithDeniedApprovals(engine),
+    env,
+    log: emit,
+  });
+
+  /** What the renderer paints from: the queue file, the run log, and whether
+   *  this window is currently draining. Read fresh on every call — the queue is
+   *  a file several hosts write to, so a cached copy would show a stale list. */
+  function snapshot() {
+    const items = queue.loadQueue(env);
+    return {
+      ok: true,
+      items,
+      pending: queue.pendingCount(items),
+      running: items.find((i) => i && i.status === 'running') || null,
+      draining,
+      stopping: stopRequested,
+      defaultCwd: process.cwd(),
+      // What a task with no model of its own actually runs on. The queue is
+      // Aegis Cloud only, so this is a pooled tier id — and the card prints it,
+      // because "which model is this drain spending on" was previously
+      // unanswerable from the UI.
+      defaultModel: autonomous.resolveModel({ env }),
+      queueFile: queue.queuePath(env),
+      runs: queue.readRuns(env, { limit: 20 }),
+    };
+  }
+
+  /**
+   * Coerce one renderer payload into queue.addTask's opts.
+   *
+   * There is no shell field on this surface and no path the main process reads
+   * or writes on the renderer's behalf: `cwd` is the directory the task's own
+   * tool loop runs in, it must be absolute and already exist, and it is passed
+   * through unmodified. model/effort/workers/maxRounds are ids, rungs and small
+   * integers — never commands — and every one of them is range-checked here so
+   * a malformed payload is refused with a reason instead of queued as work that
+   * silently runs with defaults.
+   */
+  function taskOpts(payload) {
+    const p = payload || {};
+    const task = String(p.task == null ? '' : p.task).trim();
+    if (!task) return { error: 'a queued task needs text' };
+    if (task.length > QUEUE_MAX_TASK_CHARS) {
+      return { error: `task text is too long (${task.length} > ${QUEUE_MAX_TASK_CHARS} chars)` };
+    }
+    const cwd = String(p.cwd == null ? '' : p.cwd).trim() || process.cwd();
+    if (!path.isAbsolute(cwd)) return { error: 'the working directory must be an absolute path' };
+    if (!isExistingDir(cwd)) return { error: `not a directory: ${cwd}` };
+
+    const model = String(p.model == null ? '' : p.model).trim().slice(0, 120) || null;
+    // Aegis Cloud only (autonomous.js modelRefusal): the worker's requests go
+    // out as `class: 'aegis'`, so a model the pool does not serve is a task that
+    // fails inside a drain. Refused HERE so the card gets the reason at the
+    // moment of queueing instead of a red row later. queue.addTask enforces the
+    // same rule for the CLI and for hand-written queue files.
+    const modelRefusal = model ? autonomous.modelRefusal(model) : '';
+    if (modelRefusal) return { error: modelRefusal };
+    const effortRaw = String(p.effort == null ? '' : p.effort).trim().toLowerCase();
+    return {
+      opts: {
+        task,
+        cwd,
+        model,
+        effort: QUEUE_EFFORTS.has(effortRaw) ? effortRaw : null,
+        workers: clampInt(p.workers, 1, QUEUE_MAX_WORKERS),
+        maxRounds: clampInt(p.maxRounds, 1, QUEUE_MAX_ROUNDS),
+        // The pooled-brain fan-out is opt-in (autonomous.js resolveFanout):
+        // it costs about workers+1 full reasoning calls on one task, so the
+        // card has to ask for it per task. queue.addTask stores the inverse
+        // (`singlePass`), which is also the field a hand-written queue file
+        // or the CLI uses.
+        singlePass: !(p.fanout === true || p.autonomous === true),
+        commit: Boolean(p.commit),
+        source: 'desktop',
+      },
+    };
+  }
+
+  /** `settle`-shaped one-liner per finished task, so the drain's answer carries
+   *  the outcome of every task it ran rather than only the last one. */
+  const summarize = (ran) =>
+    (ran || []).map((r) => ({ id: r.id, ok: Boolean(r.ok), error: r.error || null }));
+
+  // Note on `commit`: neither drain accepts a commit override from the
+  // renderer. Whether a task commits is a property of the TASK (the checkbox it
+  // was queued with, carried in the queue file), so `worker.proceed` is called
+  // with the flag undefined and autonomous.js falls back to each item's own
+  // `commit`. A drain-level flag would let one click rewrite another task's
+  // decision.
+
+  async function drainOnce() {
+    if (draining) return { ok: false, reason: 'a drain is already running in this window', ...snapshot() };
+    draining = true;
+    stopRequested = false;
+    let result;
+    try {
+      const tick = await worker.proceed({ max: 1 });
+      result = tick.locked
+        ? { ok: false, locked: true, holder: tick.holder, ran: [] }
+        : { ok: true, ran: summarize(tick.ran) };
+    } catch (err) {
+      // A drain that throws must still leave a readable answer (and a queue
+      // that can be inspected), not a rejected IPC promise the renderer would
+      // paint as "Invoke failed".
+      result = { ok: false, reason: errorText(err), ran: [] };
+    }
+    draining = false;
+    running = null;
+    return { ...result, ...snapshot() };
+  }
+
+  async function drainAll() {
+    if (draining) return { ok: false, reason: 'a drain is already running in this window', ...snapshot() };
+    draining = true;
+    stopRequested = false;
+    const ran = [];
+    let result;
+    try {
+      for (;;) {
+        // One task per tick through the worker's own proceed: it re-reads the
+        // FILE each time (so a task added mid-drain is picked up) and takes and
+        // releases the lock around each task, which is what lets Stop land
+        // between two tasks instead of after the whole queue.
+        const tick = await worker.proceed({ max: 1 });
+        if (tick.locked) {
+          result = { ok: false, locked: true, holder: tick.holder, ran: summarize(ran) };
+          break;
+        }
+        if (!tick.ran.length) {
+          result = { ok: true, stopped: stopRequested, ran: summarize(ran) };
+          break;
+        }
+        ran.push(...tick.ran);
+        if (stopRequested) {
+          result = { ok: true, stopped: true, ran: summarize(ran) };
+          break;
+        }
+      }
+    } catch (err) {
+      result = { ok: false, reason: errorText(err), ran: summarize(ran) };
+    }
+    draining = false;
+    running = null;
+    return { ...result, ...snapshot() };
+  }
+
+  return {
+    /** Queue one task. */
+    enqueue: (payload) => {
+      const { opts, error } = taskOpts(payload);
+      if (error) return { ok: false, reason: error, ...snapshot() };
+      const item = queue.addTask(env, opts);
+      return { ok: true, item, ...snapshot() };
+    },
+
+    /** Current state: the list, what is running, what is pending, recent runs. */
+    list: () => snapshot(),
+
+    /** Drop finished tasks (or everything with `all`). Pending and running tasks
+     *  are kept — queue.clearQueue's rule, not this surface's. */
+    clear: (payload) => ({
+      ...queue.clearQueue(env, { all: Boolean(payload && payload.all) }),
+      ok: true,
+      ...snapshot(),
+    }),
+
+    /** Put a finished/failed task back in line, keeping its attempt count. */
+    retry: (payload) => {
+      const id = payload && payload.id;
+      const item = queue.retryTask(env, id);
+      if (!item) return { ok: false, reason: `no task #${id}`, ...snapshot() };
+      return { ok: true, item, ...snapshot() };
+    },
+
+    /** Remove one task by id. A running task is refused: the worker holds it in
+     *  memory and writes its outcome back, so deleting it mid-turn would just be
+     *  re-created by that settle — stop it first. */
+    remove: (payload) => {
+      const id = payload && payload.id;
+      const items = queue.loadQueue(env);
+      const item = queue.findTask(items, id);
+      if (!item) return { ok: false, reason: `no task #${id}`, ...snapshot() };
+      if (item.status === 'running') {
+        return { ok: false, reason: `task #${item.id} is running — stop the drain first`, ...snapshot() };
+      }
+      queue.saveQueue(env, items.filter((i) => Number(i && i.id) !== Number(item.id)));
+      return { ok: true, removed: item.id, ...snapshot() };
+    },
+
+    /** Work exactly one pending task (the card's "Run one"). */
+    drain: () => drainOnce(),
+
+    /** Work pending tasks until the queue is empty, or Stop is pressed. */
+    proceed: () => drainAll(),
+
+    /** Stop: cancel the turn in flight AND the loop, so the next pending task
+     *  does not simply start. */
+    stop: (payload) => {
+      stopRequested = true;
+      const id = payload && payload.id != null ? payload.id : running;
+      const cancel = id == null ? null : worker.cancel(id);
+      return { ok: true, wasDraining: draining, cancelled: cancel, ...snapshot() };
+    },
+  };
+}
+
+/**
+ * Register the queue surface as `queue:<name>` on ipcMain — the same
+ * per-namespace pattern as MODEL_PREFIX/SYNC_PREFIX/QUICK_PREFIX above, with
+ * one addition: drain/proceed need the raw IPC event, because their progress
+ * frames are pushed to the window that ASKED for the drain, over
+ * QUEUE_PROGRESS_CHANNEL (never CHAT_DELTA_CHANNEL — see that constant).
+ */
+function registerQueueIpc(ipcMain, { engine, env, queue, autonomous } = {}) {
+  // The window a drain's frames go to. One drain runs at a time process-wide
+  // (queue.js's lock), so a single target is enough, and a second window's
+  // drain is refused by the lock rather than interleaving two progress streams.
+  let target = null;
+  const dispatch = createQueueDispatch({
+    engine,
+    env,
+    queue,
+    autonomous,
+    log: (event) => {
+      if (!target || typeof target.send !== 'function') return;
+      if (typeof target.isDestroyed === 'function' && target.isDestroyed()) return;
+      target.send(QUEUE_PROGRESS_CHANNEL, event);
+    },
+  });
+  for (const [name, handler] of Object.entries(dispatch)) {
+    if (name === 'drain' || name === 'proceed') {
+      ipcMain.handle(`${QUEUE_PREFIX}${name}`, (event, payload) => {
+        target = (event && event.sender) || null;
+        return handler(payload);
+      });
+      continue;
+    }
+    ipcMain.handle(`${QUEUE_PREFIX}${name}`, (_event, payload) => handler(payload));
+  }
+  return dispatch;
 }
 
 /**
@@ -1028,7 +1719,50 @@ const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
  * swapping the package under a running process is not something to do on the
  * user's behalf.
  */
-function createNpmUpdateManager({ onStatus }) {
+/**
+ * How long to wait before re-checking after a FAILED background check: 1m, 5m,
+ * 15m, then hourly.
+ *
+ * The 4h interval is right for a successful check — the answer changes slowly —
+ * and wrong for a failure, whose usual cause (no network yet at login, a VPN
+ * still coming up, a one-off registry blip) is gone inside a minute. Before
+ * this, a machine that launched before its Wi-Fi associated showed a hard error
+ * for the next four hours.
+ */
+const UPDATE_RETRY_BACKOFF_MS = [60_000, 5 * 60_000, 15 * 60_000, 60 * 60_000];
+
+/**
+ * The sentence the banner shows. Every one of these used to be the single fixed
+ * string "registry unreachable" — including a 404 and a 2.5s timeout, neither of
+ * which is evidence the registry was unreachable. Only the last two are claims
+ * about the network, and only when the socket actually failed.
+ */
+function describeRegistryFailure(reason, status, pkg) {
+  switch (reason) {
+    case 'not-found':
+      return `${pkg} is not published on the npm registry (404)`;
+    case 'forbidden':
+      return `the npm registry refused the request (${status || 'auth'})`;
+    case 'malformed':
+      return 'the npm registry sent a response this app could not read';
+    case 'too-large':
+      return 'the npm registry response was too large to read';
+    case 'timeout':
+      return 'the npm registry did not respond in time';
+    case 'network':
+      return 'the npm registry could not be reached';
+    default:
+      return 'the update check did not complete';
+  }
+}
+
+function createNpmUpdateManager({
+  onStatus,
+  now = () => Date.now(),
+  fetchImpl,
+  setTimeoutImpl = setTimeout,
+  clearTimeoutImpl = clearTimeout,
+} = {}) {
   const PKG = 'aegis-desktop';
   let current = 'unknown';
   try {
@@ -1036,7 +1770,21 @@ function createNpmUpdateManager({ onStatus }) {
   } catch {
     /* version is cosmetic here */
   }
-  let state = { status: 'idle', version: null, error: null, channel: 'npm' };
+  // `reason`/`transient`/`attempts`/`retryInMs`/`canDownload` are additive: the
+  // banner needs them to decide whether a failure deserves the user's
+  // attention at all, and whether there is a button worth offering.
+  let state = {
+    status: 'idle',
+    version: null,
+    error: null,
+    channel: 'npm',
+    reason: null,
+    transient: false,
+    attempts: 0,
+    retryInMs: 0,
+    command: null,
+    canDownload: false,
+  };
   const set = (patch) => {
     state = { ...state, ...patch };
     if (onStatus) onStatus(state);
@@ -1055,20 +1803,144 @@ function createNpmUpdateManager({ onStatus }) {
     }
   }
 
-  async function check() {
+  let attempts = 0;
+  let retryAt = 0;
+  let retryTimer = null;
+  let inFlight = null;
+  let interval = null;
+
+  /** 1m, 5m, 15m, 60m, 60m… — capped, never unbounded. */
+  const delayFor = () =>
+    UPDATE_RETRY_BACKOFF_MS[Math.min(Math.max(attempts - 1, 0), UPDATE_RETRY_BACKOFF_MS.length - 1)];
+
+  function clearRetry() {
+    if (retryTimer) clearTimeoutImpl(retryTimer);
+    retryTimer = null;
+  }
+
+  /** One silent re-check after a transient failure, instead of a 4h wait. */
+  function scheduleRetry() {
+    clearRetry();
+    const delay = delayFor();
+    retryAt = now() + delay;
+    retryTimer = setTimeoutImpl(() => {
+      retryTimer = null;
+      check().catch(() => {});
+    }, delay);
+    if (retryTimer && retryTimer.unref) retryTimer.unref();
+    set({ retryInMs: delay });
+  }
+
+  /**
+   * Always a detailed result, even against a vendor copy staged before
+   * `fetchLatestDetailed` existed (an already-installed older release, whose
+   * `./vendor/update.js` predates it) — falling back to the old null-or-version
+   * contract rather than throwing on `undefined is not a function`.
+   */
+  async function fetchDetailed() {
+    if (fetchImpl) return fetchImpl({ pkg: PKG });
+    if (typeof updater.fetchLatestDetailed === 'function') {
+      return updater.fetchLatestDetailed({ pkg: PKG });
+    }
+    const latest = await updater.fetchLatest({ pkg: PKG });
+    return latest
+      ? { ok: true, latest, reason: null, status: 200 }
+      : { ok: false, latest: null, reason: 'unknown', status: null };
+  }
+
+  const isTransient = (reason, status) => {
+    if (typeof updater.isTransientReason === 'function') return updater.isTransientReason(reason, status);
+    return reason === 'unknown'; // unclassified: assume retryable, stay quiet
+  };
+
+  /**
+   * `announce: false` (the default) is the background check: a network failure
+   * is swallowed and re-tried on the backoff ladder. `announce: true` is a
+   * check the user explicitly asked for (the app menu, the banner's Retry
+   * button) — they are looking at the answer, so they get it.
+   *
+   * Coalesced: the interval, the menu, the Retry button and the renderer's
+   * initial status poll can all land together, and three registry hits for one
+   * question is pointless.
+   */
+  async function check({ announce = false } = {}) {
     if (!updater) return set({ status: 'disabled', error: 'update checker unavailable' });
-    set({ status: 'checking', error: null });
-    try {
-      const latest = await updater.fetchLatest({ pkg: PKG });
-      if (!latest) return set({ status: 'error', error: 'registry unreachable' });
-      if (!updater.isNewer(latest, current)) return set({ status: 'up-to-date', version: latest });
+    if (inFlight) return inFlight;
+
+    inFlight = (async () => {
+      // What we already knew, so a transient failure cannot erase it.
+      const priorStatus = state.status;
+      const priorVersion = state.version;
+      set({ status: 'checking', error: null, reason: null, transient: false });
+
+      let res;
+      try {
+        res = await fetchDetailed();
+      } catch (err) {
+        res = { ok: false, latest: null, reason: 'unknown', status: null, error: errorText(err) };
+      }
+
+      if (res.ok) {
+        attempts = 0;
+        retryAt = 0;
+        clearRetry();
+        if (!updater.isNewer(res.latest, current)) {
+          return set({
+            status: 'up-to-date', version: res.latest, error: null, reason: null,
+            transient: false, attempts: 0, retryInMs: 0,
+          });
+        }
+        return set({
+          status: 'available',
+          version: res.latest,
+          error: null,
+          reason: null,
+          transient: false,
+          attempts: 0,
+          retryInMs: 0,
+          command: `npm i -g ${PKG}@latest`,
+          // npm owns installation here, so there is nothing for this process
+          // to download — the banner must offer the command, not a Download
+          // button that would silently do nothing.
+          canDownload: false,
+        });
+      }
+
+      attempts += 1;
+      const message = res.error || describeRegistryFailure(res.reason, res.status, PKG);
+
+      if (isTransient(res.reason, res.status)) {
+        scheduleRetry();
+        if (!announce) {
+          // Nobody asked. The network was not there yet; that is not news, and
+          // an 'available' verdict we already earned must survive it.
+          return set({
+            status: priorStatus === 'available' ? 'available' : 'unavailable',
+            version: priorVersion,
+            error: message,
+            reason: res.reason,
+            transient: true,
+            attempts,
+          });
+        }
+        return set({ status: 'error', error: message, reason: res.reason, transient: true, attempts });
+      }
+
+      // The registry answered and the answer was no (404, 403, unreadable). That
+      // is a real condition, it will not fix itself in a minute, and only the
+      // user can act on it — so it is shown either way, named accurately.
+      clearRetry();
+      retryAt = 0;
       return set({
-        status: 'available',
-        version: latest,
-        command: `npm i -g ${PKG}@latest`,
+        status: 'error', error: message, reason: res.reason,
+        transient: false, attempts, retryInMs: 0,
       });
-    } catch (err) {
-      return set({ status: 'error', error: errorText(err) });
+    })();
+
+    try {
+      return await inFlight;
+    } finally {
+      inFlight = null;
     }
   }
 
@@ -1079,18 +1951,27 @@ function createNpmUpdateManager({ onStatus }) {
     download: async () => set({
       status: state.status === 'available' ? 'available' : state.status,
       command: `npm i -g ${PKG}@latest`,
+      canDownload: false,
     }),
     quitAndInstall: () => {},
     start: () => {
       check().catch(() => {});
-      const t = setInterval(() => check().catch(() => {}), UPDATE_CHECK_INTERVAL_MS);
-      if (t.unref) t.unref();
+      interval = setInterval(() => check().catch(() => {}), UPDATE_CHECK_INTERVAL_MS);
+      if (interval.unref) interval.unref();
     },
+    // Timers are the reason this exists: a retry timer outliving the window
+    // would keep a dead check alive past app quit.
+    stop: () => {
+      clearRetry();
+      if (interval) clearInterval(interval);
+      interval = null;
+    },
+    retryState: () => ({ attempts, retryAt, inFlight: !!inFlight, hasTimer: !!retryTimer }),
   };
 }
 
 function createUpdateManager({ autoUpdater, isPackaged, onStatus }) {
-  let state = { status: 'idle', version: null, error: null };
+  let state = { status: 'idle', version: null, error: null, canDownload: false };
 
   function setState(patch) {
     state = { ...state, ...patch };
@@ -1122,7 +2003,7 @@ function createUpdateManager({ autoUpdater, isPackaged, onStatus }) {
 
   autoUpdater.on('checking-for-update', () => setState({ status: 'checking', error: null }));
   autoUpdater.on('update-available', (info) =>
-    setState({ status: 'available', version: info && info.version, error: null })
+    setState({ status: 'available', version: info && info.version, error: null, canDownload: true })
   );
   autoUpdater.on('update-not-available', () => setState({ status: 'up-to-date', error: null }));
   autoUpdater.on('download-progress', (progress) =>
@@ -1173,7 +2054,10 @@ function createUpdateManager({ autoUpdater, isPackaged, onStatus }) {
  *  createIpcDispatch — unit-testable with a stub updateManager. */
 function createUpdateDispatch(updateManager) {
   return {
-    checkForUpdates: () => updateManager.check(),
+    // The renderer only ever calls this from an explicit click (the banner's
+    // Retry), so it is announced: a user who asks gets a truthful answer about
+    // a failure instead of the silence the background check prefers.
+    checkForUpdates: () => updateManager.check({ announce: true }),
     downloadUpdate: () => updateManager.download(),
     quitAndInstallUpdate: () => {
       updateManager.quitAndInstall();
@@ -1244,7 +2128,9 @@ function buildAppMenu({ app, Menu, BrowserWindow, updateManager }) {
 
   const checkForUpdatesItem = {
     label: 'Check for Updates…',
-    click: () => updateManager.check(),
+    // Announced: a menu click is a user asking, so a failure is reported to
+    // them instead of being swallowed the way the background check prefers.
+    click: () => updateManager.check({ announce: true }),
   };
   const newChatItem = {
     label: 'New Chat',
@@ -1389,7 +2275,7 @@ function bootstrap() {
   // One settings store backs both the provider settings surface and the AEGIS
   // API key entry. It lives only in the main process and encrypts keys at rest
   // via Electron safeStorage (best-effort base64 when unavailable).
-  const { engine, sessionsDir, settings } = createEngine(aegis, {
+  const { engine, sessionsDir, settingsDir, settings } = createEngine(aegis, {
     app,
     safeStorage,
     dir: dataDir,
@@ -1441,7 +2327,15 @@ function bootstrap() {
     (url) => shell.openExternal(url),
     notifyReplyIfUnfocused
   );
-  registerModelIpc(ipcMain, engine, sessionsDir, aegis, notifyReplyIfUnfocused);
+  registerModelIpc(
+    ipcMain,
+    engine,
+    sessionsDir,
+    aegis,
+    notifyReplyIfUnfocused,
+    undefined,
+    settingsDir
+  );
 
   // Tool-call approval toggle (Settings → "Confirm before running tools"):
   // aegis:getConfirmMode / aegis:setConfirmMode. Registered here because this
@@ -1449,6 +2343,18 @@ function bootstrap() {
   // in the engine created alongside it (lib/local/engine.js gatedExecuteTool
   // reads settings.getConfirmMode() on every mutating tool call).
   registerConfirmModeIpc(ipcMain, createConfirmModeDispatch(settings));
+
+  // Local autonomous work queue: queue:<name> on ipcMain, backed by the durable
+  // queue file (desktop/lib/local/queue.js — the SAME file the `aegiscode` CLI
+  // and the other hosts read) and the unattended worker
+  // (desktop/lib/local/autonomous.js).
+  //
+  // It gets its OWN engine, built with the approval gate off: a queued task has
+  // nobody to answer a card, so the interactive engine is the wrong one to hand
+  // a worker (see createQueueEngine). Registration alone drains nothing — the
+  // queue runs only when the renderer's card asks it to, which is the whole
+  // gate: no timer, no boot drain, no idle drain.
+  registerQueueIpc(ipcMain, { engine: createQueueEngine(aegis, settings) });
 
   // ---------------------------------------------------------------------
   // Global quick-launcher (D? quick launcher): a frameless, always-on-top,
@@ -1598,6 +2504,10 @@ function bootstrap() {
   // free it.
   app.on('will-quit', () => {
     globalShortcut.unregisterAll();
+    // The update manager's retry/interval timers are unref'd so they never
+    // hold the process open, but an explicit quit should still cancel them
+    // rather than let one land during teardown.
+    if (updateManager && typeof updateManager.stop === 'function') updateManager.stop();
   });
 
   // electron-updater touches the network and expects a build-time
@@ -1803,14 +2713,23 @@ module.exports = {
   taggedChunk,
   maskKey,
   createModelDispatch,
+  readTextFileForPreview,
+  PREVIEW_READ_MAX_BYTES,
   createSyncDispatch,
   registerModelIpc,
+  createHeartbeatRetry,
+  describeSyncError,
+  HEARTBEAT_RETRY_BASE_MS,
+  HEARTBEAT_RETRY_MAX_MS,
   createEngine,
   resolveUserDataDir,
   importForeignMemory,
   isSafeExternalUrl,
   createUpdateManager,
+  createNpmUpdateManager,
   createUpdateDispatch,
+  describeRegistryFailure,
+  UPDATE_RETRY_BACKOFF_MS,
   registerUpdateIpc,
   buildAppMenu,
   createExportDispatch,
@@ -1823,4 +2742,12 @@ module.exports = {
   registerQuickLauncherIpc,
   createConfirmModeDispatch,
   registerConfirmModeIpc,
+  QUEUE_PREFIX,
+  QUEUE_PROGRESS_CHANNEL,
+  QUEUE_MAX_TASK_CHARS,
+  QUEUE_MAX_ROUNDS,
+  createQueueEngine,
+  queueEngineWithDeniedApprovals,
+  createQueueDispatch,
+  registerQueueIpc,
 };

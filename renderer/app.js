@@ -13,10 +13,14 @@
  * selection, routed in the main process. If this file grows engine logic it is
  * wrong.
  *
- * `maxTokensCeiling`/`FLAT_CEILING` come from max-tokens.js and `usageTokens`
- * from usage.js, sibling classic scripts loaded before this one (see
- * index.html) so the per-model ceiling math and the token-usage → displayed
- * number mapping stay unit-testable without window.aegis/window.models.
+ * `budgetFor`/`maxTokensCeiling`/`FLAT_CEILING`/`EFFORT_TOKEN_BUDGET` come from
+ * budget.js and `turnAccounting`/`fmtCost` from usage.js, sibling classic
+ * scripts loaded before this one (see index.html). There is no
+ * max-tokens control on this surface at all: the ceiling is display-only (what a
+ * model says its own output limit is, reported in the Model hint) and
+ * `budgetFor` answers — from the Effort rung — what a request actually travels
+ * with. The token-usage → displayed-number mapping stays unit-testable without
+ * window.aegis/models.
  */
 
 // Everything below runs inside an IIFE. preload.js's contextBridge.exposeInMainWorld
@@ -33,6 +37,11 @@ const aegis = window.aegis;
 const models = window.models;
 const sync = window.sync;
 const quickLauncher = window.quickLauncher;
+// The local autonomous work queue (main.js registerQueueIpc -> queue.js +
+// autonomous.js). Optional: a preload that predates the queue surface simply
+// has no `queue` key, and every function below no-ops on it rather than
+// crashing boot the way a chat flow without window.aegis would.
+const queueApi = window.queue;
 
 if (!aegis || !models) {
   document.body.textContent =
@@ -51,6 +60,7 @@ const ELEMENT_IDS = {
   updateBannerText: 'update-banner-text',
   updateDownloadBtn: 'update-download-btn',
   updateRestartBtn: 'update-restart-btn',
+  updateRetryBtn: 'update-retry-btn',
   updateLaterBtn: 'update-later-btn',
   connDot: 'conn-dot',
   connText: 'conn-text',
@@ -72,15 +82,11 @@ const ELEMENT_IDS = {
   modelSelect: 'model-select',
   modelPreset: 'model-preset',
   modelInput: 'model-input',
-  maxTokens: 'max-tokens',
-  maxTokensLabel: 'max-tokens-label',
-  maxTokensRow: 'max-tokens-row',
-  maxTokensAdaptive: 'max-tokens-adaptive',
-  effortRow: 'effort-row',
+  budgetHint: 'budget-hint',
   autonomousToggle: 'autonomous-toggle',
   autonomousToggleWrap: 'autonomous-toggle-wrap',
   autonomousControls: 'autonomous-controls',
-  autonomousEffort: 'autonomous-effort',
+  effortSelect: 'effort-select',
   autonomousWorkers: 'autonomous-workers',
   modelHint: 'model-hint',
   settingsList: 'settings-list',
@@ -100,6 +106,7 @@ const ELEMENT_IDS = {
   sessionsHint: 'sessions-hint',
   syncNow: 'sync-now',
   syncStatus: 'sync-status',
+  sessionMeter: 'session-meter',
   newChat: 'new-chat',
   memorySearchForm: 'memory-search-form',
   memoryQuery: 'memory-query',
@@ -125,6 +132,15 @@ const ELEMENT_IDS = {
   prompt: 'prompt',
   send: 'send',
   exploreToggle: 'explore-toggle',
+  queueTask: 'queue-task',
+  queueCwd: 'queue-cwd',
+  queueCommit: 'queue-commit',
+  queueEnqueue: 'queue-enqueue',
+  queueDrain: 'queue-drain',
+  queueProceed: 'queue-proceed',
+  queueStop: 'queue-stop',
+  queueList: 'queue-list',
+  queueHint: 'queue-hint',
 };
 
 const els = {};
@@ -137,10 +153,12 @@ for (const [prop, id] of Object.entries(ELEMENT_IDS)) {
 }
 
 const CLASS_KEY = 'aegis.class';
-const MAX_TOKENS_KEY = 'aegis.maxTokens';
-const MAX_TOKENS_ADAPTIVE_KEY = 'aegis.maxTokensAdaptive';
 const AUTONOMOUS_KEY = 'aegis.autonomous';
-const AUTONOMOUS_EFFORT_KEY = 'aegis.autonomousEffort';
+// The budget rung. Applies to every class now that the Max tokens dropdown is
+// gone, so it is no longer stored under the autonomous-mode namespace; the old
+// key is still read once at boot so an existing install keeps its rung.
+const EFFORT_KEY = 'aegis.effort';
+const LEGACY_EFFORT_KEY = 'aegis.autonomousEffort';
 const AUTONOMOUS_WORKERS_KEY = 'aegis.autonomousWorkers';
 const EXPLORE_KEY = 'aegis.explore';
 // "Work autonomously" (pool_brain worker fan-out, aegis1 services/pool_brain.py)
@@ -173,8 +191,22 @@ const CUSTOM_MODEL_PRESETS = {
   anthropic: [
     { label: 'Anthropic — Claude Sonnet 5', baseURL: 'https://api.anthropic.com/v1', model: 'claude-sonnet-5' },
     { label: 'Anthropic — Claude Haiku 4.5', baseURL: 'https://api.anthropic.com/v1', model: 'claude-haiku-4-5' },
-    { label: 'DeepSeek — v4 Flash', baseURL: 'https://api.deepseek.com/anthropic', model: 'deepseek-v4-flash' },
-    { label: 'DeepSeek — v4 Pro', baseURL: 'https://api.deepseek.com/anthropic', model: 'deepseek-v4-pro' },
+    // DeepSeek's live API serves exactly two ids (verified against
+    // GET https://api.deepseek.com/v1/models): `deepseek-flash` — the current
+    // generation, which DeepSeek calls "Flash 4.1" — and the slow tier
+    // `deepseek-v4-pro`, retired 2026-09-14 and now served as 4.1 too. The
+    // preset that used to sit here, `deepseek-v4-flash`, is a *legacy alias*
+    // DeepSeek keeps alive only for configs already carrying it, so the picker
+    // was advertising a previous generation by its dead id. Ids and labels
+    // match aegiscodex-dev src/models.js; the base URL is DeepSeek's
+    // Anthropic-Messages transport (aegis1 services/nexus_provider/catalog.py
+    // DEEPSEEK_DEFAULT_BASE), which is why these two sit under this class and
+    // not the OpenAI-compatible one. Both ids are reasoning models: the token
+    // budget for them is the Effort rung, never a stated number (they bill
+    // hidden chain-of-thought against the same budget as the answer — see
+    // budget.js).
+    { label: 'DeepSeek — Flash 4.1', baseURL: 'https://api.deepseek.com/anthropic', model: 'deepseek-flash' },
+    { label: 'DeepSeek — V4 Pro (retired → 4.1)', baseURL: 'https://api.deepseek.com/anthropic', model: 'deepseek-v4-pro' },
   ],
 };
 // The in-app AEGIS key is stored in a reserved namespace the main process
@@ -198,6 +230,118 @@ let currentSessionId = null;
 let threadMessages = [];
 let classOptions = [];
 let modelMeta = new Map(); // model id -> raw model object from listModels() (P2 §6.3 ceiling)
+
+// ------------------------------------------------------- rolling token meter
+//
+// Tokens are accounted the way the CLI accounts them: as a RUNNING SESSION
+// TOTAL, folded turn by turn, not as a per-turn number that resets at the next
+// call. The CLI's `recordTurn` (cli/src/app.js) folds every finished turn into
+// one `session` object and prints that total in the status bar and in `ctrl+t`;
+// this surface printed each turn's count and nothing else, so the only way to
+// answer "what has this session spent" was to add the rows up by eye across the
+// scrollback. That is the accounting difference between two surfaces running
+// the same engine on the same prompt.
+//
+// Keyed by sessionId rather than held in one global, because the window holds
+// several sessions across its life: switching threads must not carry one
+// thread's spend into another's meter, and resuming a thread must not start its
+// total at zero. `rollMessages` rebuilds a resumed session's total from the
+// ledger rows the shared store already keeps.
+const rollsBySession = new Map();
+
+/** The rolling tallies for a session — empty, never undefined, when unseen. */
+function rollFor(sessionId) {
+  const id = sessionId || '';
+  if (!rollsBySession.has(id)) rollsBySession.set(id, emptyRoll());
+  return rollsBySession.get(id);
+}
+
+/**
+ * Fold one finished dispatch into its session's rolling total and refresh the
+ * meter. Returns the turn's own accounting so the caller can still print the
+ * per-turn figure beside the session total (the CLI shows both: the meta row's
+ * `1.5k tok` and the status bar's rolling total).
+ */
+function foldRoll(sessionId, usage, opts = {}) {
+  const id = sessionId || '';
+  const next = rollTurn(rollFor(id), usage, opts);
+  rollsBySession.set(id, next);
+  renderRollMeter(id);
+  return next;
+}
+
+/**
+ * Paint the topbar meter. Hidden while a session has accounted for nothing —
+ * an unused thread must not display a `0 tok` it never measured — and shown
+ * the moment a turn is folded in.
+ *
+ * `live`, when given, previews the in-flight turn on top of the session's
+ * already-folded total — text estimated the same way `foldRoll` estimates a
+ * turn the wire never reported on — WITHOUT folding it: the preview roll
+ * returned by `rollTurn` here is thrown away every frame and `rollsBySession`
+ * is never written to, so the real `foldRoll` at completion still starts from
+ * the untouched persisted total and cannot double-count this turn. (`turns`/
+ * `calls` are left at their default +1 rather than forced to 0 — `fmtRoll`
+ * treats a roll with both at 0 as "nothing counted yet" and blanks the line,
+ * which hid the preview entirely.) Before this, the meter held the previous
+ * turn's total frozen for the whole reply and only jumped at the end, which
+ * read as "the counter is dead while the AI works".
+ */
+function renderRollMeter(sessionId, live) {
+  const el = els.sessionMeter;
+  if (!el) return;
+  if (currentSessionId !== sessionId) { el.hidden = true; return; }
+  let roll = rollsBySession.get(sessionId || '');
+  if (live) {
+    roll = rollTurn(roll || emptyRoll(), undefined, {
+      prompt: live.prompt,
+      reply: live.reply,
+      // The thinking trace is billed output too — see `estimatedBuckets`. Left
+      // out, this preview measured only the visible answer, so on a reasoning
+      // model the meter sat on one number for the whole (longest, priciest)
+      // phase of the turn and looked dead while the AI was demonstrably working.
+      reasoning: live.reasoning,
+    });
+  }
+  const line = roll ? fmtRoll(roll) : '';
+  el.textContent = line;
+  el.hidden = !line;
+  if (line) el.title = 'This session, counted the way the CLI counts it — every turn rolled into one running total';
+}
+
+/**
+ * The ledger fields one finished turn must carry into the session store, so
+ * the rolling total can be REBUILT when the thread is reopened.
+ *
+ * Without this the rolling meter was a one-window illusion: the store kept
+ * `{role, content}` only, so `rollMessages` found no `tokens` on any row this
+ * window had written and a reopened thread came back as a stack of
+ * unaccounted turns while the CLI — whose `recordExchange` does write `tokens`
+ * and `costUsd` into the very same file — came back with its full total. That
+ * asymmetry is the accounting difference, not the rendering of it.
+ *
+ * One authority writes the row: `ledgerRow` in usage.js, which mirrors the
+ * CLI's `appendHistory` shape exactly. A turn the wire did not report on is
+ * STILL written — as the CLI writes it, an estimate from the turn's own text
+ * marked `real: false` — because that is what keeps the live roll and the
+ * rebuilt roll the same number. Only a dispatch with neither reported usage
+ * nor any text to estimate from writes nothing: a fabricated
+ * `{input: 0, output: 0}` row would read as a measured zero forever after,
+ * which is the one lie the token meter was built to avoid.
+ */
+function ledgerFields(usage, model, turn, text) {
+  const row = ledgerRow(usage, turn, {
+    model,
+    costUsd: turn && turn.real && typeof turn.cost === 'number' ? turn.cost : undefined,
+    calls: text && text.calls,
+    prompt: text && text.prompt,
+    reply: text && text.reply,
+    reasoning: text && text.reasoning,
+  });
+  const fields = row ? Object.assign({}, row) : {};
+  if (model) fields.model = model;
+  return fields;
+}
 
 // ---------------------------------------------------------- discovery lane
 //
@@ -343,11 +487,6 @@ function exploreEnabled() {
   return Boolean(box && box.checked);
 }
 
-function maxTokensAdaptive() {
-  const box = els.maxTokensAdaptive;
-  return Boolean(box && box.checked);
-}
-
 function autonomousEnabled() {
   const box = els.autonomousToggle;
   return Boolean(box && box.checked);
@@ -361,32 +500,79 @@ function updateAutonomousControlsVisibility() {
   els.autonomousControls.hidden = !(wrapVisible && autonomousEnabled());
 }
 
+// Which models get their budget from the Effort rung — because they reason
+// against their own output limit (DeepSeek counts hidden chain-of-thought
+// against the same budget as the answer) or because their wire format requires
+// the field at all (Anthropic's Messages API) — is answered in ONE place:
+// desktop/renderer/budget.js, loaded before this file, whose
+// DEEPSEEK_REASONING_MODEL_RE / REQUIRES_STATED_BUDGET / EFFORT_TOKEN_BUDGET
+// globals are read below. test/budget.test.mjs asserts that copy and
+// desktop/lib/local/engine.js answer identically, so neither can drift.
+
 /**
- * Which budget control applies to the selected class.
- *
- * Aegis Cloud is sized server-side from `effort`; the other three classes take
- * a per-call token ceiling from the dropdown. Showing both at once is what made
- * the token cap untrustworthy on the pooled class — the dropdown was displayed,
- * read on every send, and then raised by the server's effort ladder, so the
- * number beside it was never the budget the call ran on. Exactly one control is
- * on offer now, and it is the one the request actually travels with.
+ * The model id the budget control has to reason about right now: the typed id
+ * for a custom endpoint, the picker's value everywhere else.
  */
-function updateBudgetControls(cls) {
-  const pooled = cls === AUTONOMOUS_CLASS;
-  if (els.effortRow) els.effortRow.hidden = !pooled;
-  if (els.maxTokensRow) els.maxTokensRow.hidden = pooled;
-  if (els.maxTokensLabel) els.maxTokensLabel.hidden = pooled;
+function currentBudgetModel() {
+  return CUSTOM_CLASSES.has(els.classSelect.value)
+    ? els.modelInput.value.trim()
+    : els.modelSelect.value;
 }
 
 /**
- * The effort to send, or undefined for the classes the server does not size
- * from it. `auto` means "let the server infer it from the ask" — the same thing
- * the server already does for a request that names no effort, and a deliberate
- * choice rather than the old silent fall-through to the top rung.
+ * The one-line statement of what the current selection means in tokens.
+ *
+ * Written on every class/model change so the rung is never an invisible
+ * decision: "Effort: high" says nothing about the budget it buys, and the whole
+ * reason the Max tokens dropdown was removed is that the number it showed was
+ * never the number the call ran on. The ladder printed here is the one the
+ * request will actually be sized by — the engine's effort rung for a local
+ * reasoning model or an Anthropic call, the server's own fan-out ladder for the
+ * pooled class — and for the two classes that send no number at all the note
+ * says so rather than implying a cap nobody set.
  */
-function effortFor(cls) {
-  if (cls !== AUTONOMOUS_CLASS) return undefined;
-  const value = els.autonomousEffort && els.autonomousEffort.value;
+function budgetNote(cls, model) {
+  const chosen = effortFor();
+  const rung = chosen || 'high';
+  const rungText = chosen || 'auto → high';
+  if (cls === AUTONOMOUS_CLASS) {
+    // aegis1 services/pool_brain.py pass_budgets — the total across the worker
+    // fan-out + synthesis pass, which is why it is not the local table.
+    const totals = { low: 16384, medium: 32768, high: 65536 };
+    return `budget: ${totals[rung].toLocaleString()} tokens from effort (${rungText}), ` +
+      'summed across the worker fan-out by the Aegis Cloud pool — no max_tokens is sent.';
+  }
+  if (DEEPSEEK_REASONING_MODEL_RE.test(String(model || '')) || REQUIRES_STATED_BUDGET.has(cls)) {
+    const tokens = EFFORT_TOKEN_BUDGET[rung];
+    return `budget: ${tokens.toLocaleString()} tokens from effort (${rungText}) — ` +
+      'this model reasons against its own output budget, and the length of the answer ' +
+      'is not predictable from the prompt.';
+  }
+  return `no token cap is sent (effort: ${rungText}) — output length cannot be predicted ` +
+    'from the prompt, so this app states no max_tokens and the provider\'s own limit applies.';
+}
+
+/**
+ * Refresh the budget surface for the selected class + model. There is no
+ * control to swap any more (the Max tokens dropdown is gone), so this only
+ * restates what the rung buys — but it still has to run on every class and
+ * model change, because that note is the only place the number appears.
+ */
+function updateBudgetControls(cls, model) {
+  const resolved = model === undefined ? currentBudgetModel() : model;
+  if (els.budgetHint) els.budgetHint.textContent = budgetNote(cls, resolved);
+}
+
+/**
+ * The effort to send, or undefined for "no rung pinned".
+ *
+ * Sent for EVERY class and model, not just the pooled one: with no max-tokens
+ * control there is nothing else that sizes a call, and `auto` means "no rung
+ * pinned" — the engine's high default — rather than the old silent
+ * fall-through to the top rung.
+ */
+function effortFor() {
+  const value = els.effortSelect && els.effortSelect.value;
   return value && value !== 'auto' ? value : undefined;
 }
 
@@ -432,8 +618,13 @@ function renderUpdateBanner(state) {
   if (!els.updateBanner) return;
   lastUpdateState = state;
   const status = state && state.status;
+  // 'unavailable' is the npm channel's silent verdict after a background check
+  // that failed for a transient reason (no network yet at login, a VPN coming
+  // up). It is deliberately not shown: nobody asked, and the app re-checks on
+  // its own backoff. An explicit check never resolves this status — the main
+  // process reports 'error' when a user asked.
   const silent = !status || status === 'idle' || status === 'disabled' ||
-    status === 'checking' || status === 'up-to-date';
+    status === 'checking' || status === 'up-to-date' || status === 'unavailable';
   if (silent || status === updateDismissedFor) {
     els.updateBanner.hidden = true;
     return;
@@ -442,10 +633,15 @@ function renderUpdateBanner(state) {
   let text = '';
   let showDownload = false;
   let showRestart = false;
+  let showRetry = false;
   const version = state.version ? `v${state.version} ` : '';
   if (status === 'available') {
-    text = `Update ${version}available.`;
-    showDownload = true;
+    // The npm channel cannot install itself, so its banner names the command
+    // instead of offering a Download button that would do nothing.
+    text = state.command
+      ? `Update ${version}available — run: ${state.command}`
+      : `Update ${version}available.`;
+    showDownload = !!state.canDownload;
   } else if (status === 'downloading') {
     const pct = typeof state.progress === 'number' ? ` (${Math.round(state.progress)}%)` : '';
     text = `Downloading update${pct}…`;
@@ -453,7 +649,12 @@ function renderUpdateBanner(state) {
     text = `Update ${version}downloaded — restart to install.`;
     showRestart = true;
   } else if (status === 'error') {
+    // The reason comes from the main process and names what actually happened
+    // (a timeout, a 404, an unreadable response) rather than blaming the
+    // registry for every failure.
     text = `Update check failed: ${state.error || 'unknown error'}`;
+    if (state.transient) text += ' — will retry automatically.';
+    showRetry = true;
   } else {
     els.updateBanner.hidden = true;
     return;
@@ -462,6 +663,9 @@ function renderUpdateBanner(state) {
   els.updateBannerText.textContent = text;
   els.updateDownloadBtn.hidden = !showDownload;
   els.updateRestartBtn.hidden = !showRestart;
+  // `?`-guarded: the markup is optional and an older index.html must not crash
+  // the banner on a status it has no button for.
+  if (els.updateRetryBtn) els.updateRetryBtn.hidden = !showRetry;
   els.updateBanner.hidden = false;
 }
 
@@ -757,6 +961,296 @@ async function saveConfirmMode(enabled) {
   } finally {
     els.confirmMode.disabled = false;
     if (els.autoMode) els.autoMode.disabled = false;
+  }
+}
+
+// ------------------------------------------------------ autonomous queue
+//
+// The desktop half of the local work queue (window.queue -> main.js
+// registerQueueIpc -> desktop/lib/local/queue.js + autonomous.js). The card is
+// the ONLY trigger: `Run one` and `Drain all` are what call queue.drain() and
+// queue.proceed(), and nothing in this file starts a drain by itself — no
+// interval, no drain at boot, no drain when the window goes idle. A drain runs a
+// whole tool loop on a real model inside the folder in the cwd field, so it
+// happens when the user asks and not otherwise.
+//
+// What the card shows is STATE, not conversation. The worker's frames arrive on
+// `queue:progress` (its own channel — see main.js QUEUE_PROGRESS_CHANNEL, and
+// why a drain must never ride the chat delta channel) and are collapsed into one
+// status line; each task's outcome (done/failed + error) is read back from the
+// queue file through queue.list(). A worker's output is never appended to the
+// open thread.
+
+/** The last thing the card said; composed with the queue's own counts on every
+ *  repaint, so a one-off message ("not a directory: …") is not lost the moment a
+ *  state refresh overwrites the line. */
+let queueNote = '';
+/** Whether THIS window's drain is running, from main's own snapshot — never a
+ *  local guess, so a drain that ended (or was locked out) unlatches the buttons. */
+let queueDraining = false;
+
+function setQueueNote(text) {
+  queueNote = text || '';
+  if (els.queueHint) els.queueHint.textContent = queueNote;
+}
+
+/** `#3 ✓ task …` — the outcome mark leads, so a failed task is findable. */
+function queueStatusMark(status) {
+  if (status === 'done') return '✓';
+  if (status === 'error') return '✗';
+  if (status === 'running') return '…';
+  return '·';
+}
+
+/** The outcome line under a task: what happened, or why it did not. */
+function queueMetaText(item) {
+  const bits = [item.status];
+  // Which model and which shape, per row. Both are spend facts the card used
+  // to hide: an unpinned task runs main.js's defaultModel (a pooled tier), and
+  // a task is a single pass unless it was queued with `fanout` — the difference
+  // is roughly (workers + 1) full reasoning calls.
+  if (item.model) bits.push(item.model);
+  bits.push(item.singlePass === false || item.autonomous === true ? 'fan-out' : 'single pass');
+  if (item.status === 'error') {
+    bits.push(item.error ? String(item.error) : 'failed — no reason recorded');
+  } else if (item.status === 'done') {
+    const out = item.result && item.result.output ? String(item.result.output) : '';
+    const flat = out.replace(/\s+/g, ' ').trim();
+    if (flat) bits.push(flat.length > 140 ? `${flat.slice(0, 139)}…` : flat);
+    const files = item.result && Array.isArray(item.result.files) ? item.result.files : [];
+    if (files.length) bits.push(`touched ${files.length} file${files.length === 1 ? '' : 's'}`);
+  } else if (item.status === 'running') {
+    bits.push(item.startedAt ? `started ${relTime(item.startedAt)}` : 'working');
+  } else {
+    if (item.attempts) bits.push(`${item.attempts} attempt${item.attempts === 1 ? '' : 's'}`);
+    if (item.created) bits.push(relTime(item.created));
+  }
+  return bits.join(' · ');
+}
+
+/** One row per task: id, outcome mark, task text, outcome line, and only the
+ *  actions that mean something for that status (a running task belongs to the
+ *  worker — main.js refuses to remove it). */
+function queueRow(item) {
+  const li = document.createElement('li');
+  li.className = 'session-row';
+  li.dataset.status = item.status;
+
+  const title = document.createElement('span');
+  title.className = 'session-title';
+  const text = String(item.task || '').replace(/\s+/g, ' ').trim();
+  title.textContent = `#${item.id} ${queueStatusMark(item.status)} ${text.length > 90 ? `${text.slice(0, 89)}…` : text}`;
+  li.appendChild(title);
+
+  const meta = document.createElement('span');
+  meta.className = 'session-meta';
+  meta.textContent = queueMetaText(item);
+  li.appendChild(meta);
+
+  if (item.status === 'done' || item.status === 'error') {
+    const retry = document.createElement('button');
+    retry.type = 'button';
+    retry.className = 'ghost-btn';
+    retry.textContent = 'Retry';
+    retry.title = 'Put this task back in line and run it again';
+    retry.addEventListener('click', () => queueTaskAction('retry', item.id));
+    li.appendChild(retry);
+  }
+  if (item.status !== 'running') {
+    const drop = document.createElement('button');
+    drop.type = 'button';
+    drop.className = 'ghost-btn';
+    drop.textContent = 'Remove';
+    drop.addEventListener('click', () => queueTaskAction('remove', item.id));
+    li.appendChild(drop);
+  }
+  return li;
+}
+
+/** Paint a queue.list()/drain()/proceed() answer: the list, what is running and
+ *  how many are pending, and the running/stopping state of this window. */
+function renderQueueState(state) {
+  if (!els.queueList || !state || typeof state !== 'object') return;
+  queueDraining = Boolean(state.draining);
+
+  // The cwd field is a convenience, never an override: it is prefilled from the
+  // main process's working directory only while the user has not typed one.
+  if (els.queueCwd && !els.queueCwd.value) els.queueCwd.value = state.defaultCwd || '';
+
+  if (els.queueEnqueue) els.queueEnqueue.disabled = queueDraining;
+  if (els.queueDrain) els.queueDrain.disabled = queueDraining;
+  if (els.queueProceed) els.queueProceed.disabled = queueDraining;
+  if (els.queueStop) els.queueStop.hidden = !queueDraining;
+
+  const items = Array.isArray(state.items) ? state.items : [];
+  els.queueList.innerHTML = '';
+  if (!items.length) {
+    const li = document.createElement('li');
+    li.className = 'empty';
+    li.textContent = 'queue is empty';
+    els.queueList.appendChild(li);
+  } else {
+    for (const item of items) els.queueList.appendChild(queueRow(item));
+  }
+
+  const bits = [];
+  if (state.running) bits.push(`running #${state.running.id}`);
+  else if (queueDraining) bits.push('draining…');
+  bits.push(`${state.pending || 0} pending`);
+  // What the queue can spend on at all: Aegis Cloud, and which tier an
+  // unpinned task lands on (main.js snapshot().defaultModel resolves it the
+  // same way the worker does, so the card cannot disagree with the bill).
+  if (state.defaultModel) bits.push(`Aegis Cloud · ${state.defaultModel}`);
+  if (queueDraining && state.stopping) bits.push('stopping after this task');
+  if (els.queueHint) {
+    els.queueHint.textContent = [queueNote, bits.join(' · ')].filter(Boolean).join(' · ');
+  }
+}
+
+/** Read the queue (a list, never a drain) — the card's paint on boot and after
+ *  every action. */
+async function loadQueueState() {
+  if (!queueApi || !els.queueList) return null;
+  try {
+    const state = await queueApi.list();
+    renderQueueState(state);
+    return state;
+  } catch (err) {
+    setQueueNote(`queue list failed: ${err && err.message ? err.message : err}`);
+    return null;
+  }
+}
+
+/** Queue the textarea's contents against the cwd field's directory. `commit` is
+ *  stored on the TASK, so it applies to that task alone however it is later run. */
+async function enqueueQueueTask() {
+  if (!queueApi || !els.queueTask) return;
+  const task = els.queueTask.value.trim();
+  if (!task) {
+    setQueueNote('type a task first');
+    return;
+  }
+  if (els.queueEnqueue) els.queueEnqueue.disabled = true;
+  setQueueNote('queueing…');
+  try {
+    const res = await queueApi.enqueue({
+      task,
+      cwd: els.queueCwd ? els.queueCwd.value.trim() : '',
+      commit: els.queueCommit ? els.queueCommit.checked : false,
+    });
+    if (res && res.ok) {
+      els.queueTask.value = '';
+      setQueueNote(`queued #${res.item.id}`);
+    } else {
+      setQueueNote((res && res.reason) || 'enqueue failed');
+    }
+    renderQueueState(res);
+  } catch (err) {
+    setQueueNote(`enqueue failed: ${err && err.message ? err.message : err}`);
+  } finally {
+    if (els.queueEnqueue) els.queueEnqueue.disabled = queueDraining;
+  }
+}
+
+/** One line for what a drain did: how many ran, how many failed (by id), or the
+ *  reason it could not run at all (a lock held by another process, no work). */
+function queueDrainNote(res) {
+  if (!res || typeof res !== 'object') return 'the drain did not answer';
+  if (res.locked) {
+    const pid = res.holder && res.holder.pid;
+    return `another drain is already running${pid ? ` (pid ${pid})` : ''}`;
+  }
+  if (res.ok === false) return res.reason || 'the drain did not run';
+  const ran = Array.isArray(res.ran) ? res.ran : [];
+  if (!ran.length) return res.stopped ? 'stopped before the next task' : 'nothing pending';
+  const failed = ran.filter((r) => !r.ok);
+  const bits = [`ran ${ran.length} — ${ran.length - failed.length} done`];
+  if (failed.length) bits.push(`failed #${failed.map((r) => r.id).join(', #')}`);
+  if (res.stopped) bits.push('stopped');
+  return bits.join(' · ');
+}
+
+/** Start a drain. `one` works a single task (the card's "Run one"), `all` keeps
+ *  going until the queue is empty or Stop is pressed. Both are the user's click
+ *  and nothing else — this is the only place either IPC method is called. */
+async function startQueueDrain(mode) {
+  if (!queueApi) return;
+  queueDraining = true;
+  setQueueNote(mode === 'one' ? 'running one task…' : 'draining the queue…');
+  if (els.queueDrain) els.queueDrain.disabled = true;
+  if (els.queueProceed) els.queueProceed.disabled = true;
+  if (els.queueEnqueue) els.queueEnqueue.disabled = true;
+  if (els.queueStop) els.queueStop.hidden = false;
+  try {
+    const res = await (mode === 'one' ? queueApi.drain() : queueApi.proceed());
+    setQueueNote(queueDrainNote(res));
+    renderQueueState(res);
+  } catch (err) {
+    // A rejected invoke means main never answered: unlatch the buttons here,
+    // since there is no snapshot coming to do it.
+    queueDraining = false;
+    if (els.queueDrain) els.queueDrain.disabled = false;
+    if (els.queueProceed) els.queueProceed.disabled = false;
+    if (els.queueEnqueue) els.queueEnqueue.disabled = false;
+    if (els.queueStop) els.queueStop.hidden = true;
+    setQueueNote(`drain failed: ${err && err.message ? err.message : err}`);
+  }
+}
+
+/** Stop: cancels the turn in flight and ends the loop, so the next pending task
+ *  does not simply start. The drain promise then resolves with the tasks it did
+ *  finish, and renderQueueState paints that answer. */
+async function stopQueueDrain() {
+  if (!queueApi) return;
+  if (els.queueStop) els.queueStop.disabled = true;
+  setQueueNote('stopping…');
+  try {
+    const res = await queueApi.stop();
+    const cancelled = res && res.cancelled && res.cancelled.ok;
+    queueNote = cancelled ? 'stopped the running task' : 'stop requested';
+    renderQueueState(res);
+  } catch (err) {
+    setQueueNote(`stop failed: ${err && err.message ? err.message : err}`);
+  } finally {
+    if (els.queueStop) els.queueStop.disabled = false;
+  }
+}
+
+/** Retry or remove one task by id (the two row buttons). Both are single writes
+ *  to the queue file, and both repaint from main's answer. */
+async function queueTaskAction(name, id) {
+  if (!queueApi) return;
+  setQueueNote(`${name} #${id}…`);
+  try {
+    const res = await queueApi[name](id);
+    if (res && res.ok === false) setQueueNote(res.reason || `${name} failed`);
+    else setQueueNote(`${name === 'retry' ? 're-queued' : 'removed'} #${id}`);
+    renderQueueState(res);
+  } catch (err) {
+    setQueueNote(`${name} failed: ${err && err.message ? err.message : err}`);
+  }
+}
+
+/** Live drain progress -> one status line. `delta`/`reasoning` frames are
+ *  deliberately dropped: they are a worker's own output, and the place for a
+ *  task's result is its row (from queue.list()), not the open transcript. */
+function renderQueueProgress(event) {
+  if (!event || typeof event !== 'object') return;
+  const id = event.taskId == null ? '' : `#${event.taskId} `;
+  if (event.type === 'start') {
+    setQueueNote(`${id}running${event.model ? ` on ${event.model}` : ''}…`);
+  } else if (event.type === 'tool' && event.tool) {
+    setQueueNote(`${id}${toolActivityLabel(event.tool)}`);
+  } else if (event.type === 'finish') {
+    setQueueNote(`${id}${event.ok ? 'done' : 'failed'} — refreshing`);
+    loadQueueState();
+  } else if (event.type === 'recovered') {
+    const ids = Array.isArray(event.ids) ? event.ids : [];
+    setQueueNote(`recovered ${ids.length} stalled task${ids.length === 1 ? '' : 's'}`);
+  } else if (event.type === 'locked') {
+    setQueueNote('another drain is already running');
+  } else if (event.type === 'queued') {
+    setQueueNote(`queued phase ${event.phase}`);
   }
 }
 
@@ -1556,6 +2050,11 @@ async function spawnPath(card, spec) {
         card.classList.remove('pending');
         state.textContent = 'streaming…';
       }
+      // `phase: 'run'` is the frame that opens the CLI's live row before the
+      // tool executes. This line is retrospective by design (see
+      // toolActivityLabel), so acting on the run frame too would print every
+      // tool twice — once when it starts, once when it finishes.
+      if (chunk.tool.phase === 'run') { captureDiffPreview(chunk.tool); return; }
       appendToolActivity(card, chunk.tool, 'flow-tools', '.flow-body');
       return;
     }
@@ -1592,6 +2091,15 @@ async function spawnPath(card, spec) {
         // text nor a tool call would trigger the empty-turn recovery — an
         // extra dispatch this lane has no gathered context to justify.
         tools: false,
+        // `singlePass` is what makes that promise true on the pooled class.
+        // The engine derives the pooled brain flag as
+        // `singlePass ? false : autonomous ? true : undefined`, and this lane
+        // set neither: on a `nexus-brain*` id the flag was `undefined`, so the
+        // model id's own default decided — which is the fan-out. A card that
+        // was meant to be one cheap 1024-token pass could therefore bill a
+        // workers + synthesis dispatch, twice per turn. Explicit `false` =
+        // one provider call, always.
+        singlePass: true,
         sessionId: id,
       },
       onDelta
@@ -1608,8 +2116,34 @@ async function spawnPath(card, spec) {
     const bits = [spec.path.title];
     if (data && data.model) bits.push(data.model);
     else if (spec.model) bits.push(spec.model);
-    const flowTokens = usageTokens(data && data.usage);
-    if (flowTokens != null) bits.push(`${flowTokens} tokens`);
+    // A lane card is a dispatch the same way a turn is, and it was the
+    // un-costed half of the 3x story: it reported tokens with no charge beside
+    // them, so the extra calls were the least visible thing on the screen.
+    const flow = turnAccounting(data && data.usage, spec.model, {
+      costUsd: data && typeof data.costUsd === 'number' ? data.costUsd : undefined,
+    });
+    if (flow.tokens != null) bits.push(`${flow.tokens} tokens`);
+    if (flow.cost != null) bits.push(fmtCost(flow.cost, flow.real));
+    // …and roll it into the session, which is the half that was missing. The
+    // card shows this ONE dispatch; a session total that skipped it would be
+    // the lane's calls — the extra ones this feature's cost story is made of —
+    // being the only calls on screen that never get counted. `turns: 0`
+    // because a discovery path is not a turn the user asked for: it
+    // contributes tokens and calls, and leaves the turn count to real
+    // exchanges.
+    const roll = foldRoll(spec.parentSessionId, data && data.usage, {
+      model: spec.model,
+      costUsd: data && typeof data.costUsd === 'number' ? data.costUsd : undefined,
+      calls: data && data.calls,
+      turns: 0,
+      // The dispatch's own prompt and stream, for the same reason as the turn
+      // site: a path that reports no usage is estimated from its own text and
+      // counted, instead of leaving the lane's calls out of the session total.
+      prompt: `Original request:\n${spec.prompt}\n\n${spec.path.hint}`,
+      reply: text,
+    });
+    const rollLine = fmtRoll(roll);
+    if (rollLine) bits.push(`session: ${rollLine}`);
     meta.textContent = bits.join(' · ');
   } catch (err) {
     const message = err && err.message ? err.message : String(err);
@@ -1732,6 +2266,54 @@ function setBusy(busy, { cancellable } = {}) {
 const TOOL_LABEL_MAX = 72;
 
 /**
+ * Host tool names whose calls render as a collapsible diff block instead of a
+ * bare line. The engine's own spellings (`Edit`/`Write`/`MultiEdit`) are
+ * included so a frame from a newer engine renders the same rather than falling
+ * back to a plain row.
+ */
+const EDIT_TOOL_NAMES = new Set(['editFile', 'writeFile', 'Edit', 'Write', 'MultiEdit']);
+
+/**
+ * Diff previews captured on a tool's `phase: 'run'` frame, keyed by tool id.
+ * The run frame fires strictly before the executor writes, which is the only
+ * moment a `writeFile`'s pre-edit contents can still be read — so the preview
+ * is built there and replayed when the matching `done` frame arrives.
+ */
+const toolPreviews = new Map();
+
+/**
+ * The pre-edit read a `writeFile`/`Write` preview needs. The renderer runs
+ * sandboxed (main.js sets contextIsolation + sandbox, so there is no
+ * `node:fs`), so the read goes over the preload bridge's synchronous
+ * `readTextFile`. Main confines the path to the session cwd it is handed, so
+ * `cwd` must travel with the call — without it main has nothing to contain
+ * against and refuses, which degrades the write to a create-style diff (all
+ * additions). `editFile` carries its own old_string and needs no read, so it
+ * always renders a full diff regardless.
+ */
+function hostReadFile(file, cwd) {
+  try {
+    const bridge = typeof window !== 'undefined' ? window.aegis : null;
+    if (bridge && typeof bridge.readTextFile === 'function') {
+      return bridge.readTextFile(file, cwd);
+    }
+  } catch {
+    // A bridge that throws must not break the render path.
+  }
+  return undefined;
+}
+
+/** Build and stash the diff preview for an edit tool when its run frame arrives. */
+function captureDiffPreview(tool) {
+  if (!tool || !EDIT_TOOL_NAMES.has(tool.name) || tool.id == null) return;
+  // editPreview calls readFile(file) with no cwd, so bind the frame's cwd here.
+  const cwd = tool.cwd;
+  const readFile = (file) => hostReadFile(file, cwd);
+  const preview = editPreview(tool.name, tool.args, { cwd, readFile });
+  if (preview) toolPreviews.set(tool.id, preview);
+}
+
+/**
  * One display line for a completed tool call (`onDelta`'s `{ tool: {name,
  * args, ok} }` chunk — see desktop/lib/local/engine.js). Fires after the tool
  * already ran, so this is a retrospective log line, not a live spinner.
@@ -1756,7 +2338,12 @@ function toolActivityLabel(tool) {
   return `→ ${name}${shown ? ` ${shown}` : ''} ${mark}`;
 }
 
-/** Append one tool-activity line to `row`, creating the container on first use. */
+/**
+ * Append one tool-activity line to `row`, creating the container on first use.
+ * An edit tool whose preview was captured on its run frame renders as a
+ * collapsible diff block in place of the bare line; every other tool keeps the
+ * plain `→ name path ✓` row.
+ */
 function appendToolActivity(row, tool, containerClass, beforeSelector) {
   if (!row) return;
   let toolsEl = row.querySelector(`.${containerClass}`);
@@ -1766,6 +2353,15 @@ function appendToolActivity(row, tool, containerClass, beforeSelector) {
     const before = beforeSelector ? row.querySelector(beforeSelector) : null;
     if (before) row.insertBefore(toolsEl, before);
     else row.appendChild(toolsEl);
+  }
+  const preview = tool && tool.id != null ? toolPreviews.get(tool.id) : null;
+  if (preview) {
+    toolPreviews.delete(tool.id); // one-shot: a stale id must not replay on a retry
+    const block = renderDiffBlock(preview, document);
+    if (block) {
+      toolsEl.appendChild(block);
+      return toolsEl;
+    }
   }
   const line = document.createElement('div');
   line.textContent = toolActivityLabel(tool);
@@ -1943,31 +2539,6 @@ async function loadClasses() {
   await loadModels(els.classSelect.value);
 }
 
-// Disable max-tokens options above the selected model's ceiling and clamp the
-// current selection down if it no longer fits; falls back to the flat 300k
-// ceiling (all options enabled) when no per-model metadata is known. When
-// "adaptive" is on, the manual select is irrelevant — the effective value
-// (returned here, read by send()) is always the model's own ceiling — so the
-// select is disabled rather than clamped.
-function applyMaxTokensClamp(modelId) {
-  const meta = modelId ? modelMeta.get(modelId) : null;
-  const ceiling = maxTokensCeiling(meta);
-  const adaptive = maxTokensAdaptive();
-  els.maxTokens.disabled = adaptive;
-  for (const opt of els.maxTokens.options) {
-    opt.disabled = Number(opt.value) > ceiling;
-  }
-  if (!adaptive && Number(els.maxTokens.value) > ceiling) {
-    const enabled = Array.from(els.maxTokens.options).filter((o) => !o.disabled);
-    const fallback = enabled[enabled.length - 1];
-    if (fallback) {
-      els.maxTokens.value = fallback.value;
-      localStorage.setItem(MAX_TOKENS_KEY, els.maxTokens.value);
-    }
-  }
-  return ceiling;
-}
-
 async function loadModels(cls) {
   // "Work autonomously" only makes sense for the pooled AEGIS Cloud class —
   // hide it for Ollama/custom endpoints rather than showing a checkbox that
@@ -1988,7 +2559,6 @@ async function loadModels(cls) {
 
   if (custom) {
     modelMeta = new Map();
-    applyMaxTokensClamp(null);
     let cfg = { baseURL: '', configured: false, keyMask: null };
     try {
       const settings = (await models.settings.get()) || [];
@@ -2088,10 +2658,18 @@ async function loadModels(cls) {
       hint = null; // carries a link, built below
     } else if (!list.length) {
       hint = cls === 'ollama' ? 'Ollama not running or no models pulled.' : 'No models listed.';
+    } else if (cls === 'byok' && data && data.needsProviderKey) {
+      // Unlike the pooled 'aegis' class, byok still shows every model here —
+      // the catalog answers with no key at all — but none of them are
+      // usable until a provider key is saved in Provider settings below.
+      hint = `${list.length} model${list.length === 1 ? '' : 's'} available — ` +
+        'add a provider key in Provider settings below to use one.';
     } else {
       hint = `${list.length} model${list.length === 1 ? '' : 's'} available.`;
     }
-    const ceiling = applyMaxTokensClamp(els.modelSelect.value);
+    // Display-only: what this model says its own output limit is. It sizes no
+    // request — budgetFor() answers that from the Effort rung.
+    const ceiling = maxTokensCeiling(modelMeta.get(els.modelSelect.value));
     if (needsKey) {
       // The hint elements are bare <p>s, so the link has to be a real child
       // node — a text assignment would wipe it (same shape as capNotice).
@@ -2110,7 +2688,6 @@ async function loadModels(cls) {
       ceiling < FLAT_CEILING ? `${hint} · max output: ${ceiling.toLocaleString()}` : hint;
   } catch (err) {
     modelMeta = new Map();
-    applyMaxTokensClamp(null);
     els.modelHint.textContent =
       `listModels failed: ${err && err.message ? err.message : err}`;
   }
@@ -2127,6 +2704,10 @@ function applyCustomPreset(cls, modelId) {
   const preset = (CUSTOM_MODEL_PRESETS[cls] || []).find((p) => p.model === modelId);
   if (!preset) return;
   els.modelInput.value = preset.model;
+  // The id just changed, so the budget note may have to as well: DeepSeek —
+  // Flash 4.1 is sized by the Effort rung (budget.js), which is a different
+  // statement than the one for a plain OpenAI-compatible id.
+  updateBudgetControls(cls);
 
   const row = els.settingsList.querySelector(`.setting-row[data-provider="${cls}"]`);
   const baseInput = row && row.querySelector('.setting-base');
@@ -2142,6 +2723,71 @@ function applyCustomPreset(cls, modelId) {
 }
 
 // -------------------------------------------------------------- settings pane
+
+/**
+ * One provider-settings row: name, an optional base-URL field, a key input,
+ * a status label and Save/Remove buttons wired to the generic
+ * `models.settings.*` surface. Shared by the two custom endpoints (which
+ * need a base URL) and the byok providers (which do not — the server
+ * dictates the endpoint; only the key is theirs to set).
+ */
+function buildSettingRow({ provider, name, cfg, showBaseURL, onSave, onRemove }) {
+  const row = document.createElement('div');
+  row.className = 'setting-row';
+  // Targeted by applyCustomPreset() so picking a Model-card preset can
+  // quick-fill the matching base URL here without a full loadSettings()
+  // round trip.
+  row.dataset.provider = provider;
+
+  const label = document.createElement('div');
+  label.className = 'setting-name';
+  label.textContent = name;
+  row.appendChild(label);
+
+  let baseInput = null;
+  if (showBaseURL) {
+    baseInput = document.createElement('input');
+    baseInput.type = 'text';
+    baseInput.className = 'setting-input setting-base';
+    baseInput.placeholder = 'base URL';
+    baseInput.value = cfg.baseURL || '';
+    row.appendChild(baseInput);
+  }
+
+  const keyInput = document.createElement('input');
+  keyInput.type = 'password';
+  keyInput.className = 'setting-input';
+  keyInput.placeholder = cfg.configured
+    ? `key ${cfg.keyMask} (blank = keep)`
+    : 'API key';
+  row.appendChild(keyInput);
+
+  const status = document.createElement('div');
+  status.className = 'setting-status';
+  status.textContent = cfg.configured ? `configured (${cfg.keyMask})` : 'no key';
+  row.appendChild(status);
+
+  const actions = document.createElement('div');
+  actions.className = 'setting-actions';
+
+  const saveBtn = document.createElement('button');
+  saveBtn.type = 'button';
+  saveBtn.className = 'ghost-btn';
+  saveBtn.textContent = 'Save';
+  saveBtn.addEventListener('click', () => onSave(baseInput ? baseInput.value.trim() : '', keyInput.value));
+  actions.appendChild(saveBtn);
+
+  const removeBtn = document.createElement('button');
+  removeBtn.type = 'button';
+  removeBtn.className = 'ghost-btn danger';
+  removeBtn.textContent = 'Remove';
+  removeBtn.disabled = !cfg.configured;
+  removeBtn.addEventListener('click', onRemove);
+  actions.appendChild(removeBtn);
+
+  row.appendChild(actions);
+  return row;
+}
 
 async function loadSettings() {
   els.settingsList.innerHTML = '';
@@ -2167,61 +2813,38 @@ async function loadSettings() {
       configured: false,
       keyMask: null,
     };
+    els.settingsList.appendChild(buildSettingRow({
+      provider, name, cfg, showBaseURL: true,
+      onSave: (baseURL, key) => saveSetting(provider, baseURL, key),
+      onRemove: () => removeSetting(provider),
+    }));
+  }
 
-    const row = document.createElement('div');
-    row.className = 'setting-row';
-    // Targeted by applyCustomPreset() so picking a Model-card preset can
-    // quick-fill the matching base URL here without a full loadSettings()
-    // round trip.
-    row.dataset.provider = provider;
-
-    const label = document.createElement('div');
-    label.className = 'setting-name';
-    label.textContent = name;
-    row.appendChild(label);
-
-    const baseInput = document.createElement('input');
-    baseInput.type = 'text';
-    baseInput.className = 'setting-input setting-base';
-    baseInput.placeholder = 'base URL';
-    baseInput.value = cfg.baseURL || '';
-    row.appendChild(baseInput);
-
-    const keyInput = document.createElement('input');
-    keyInput.type = 'password';
-    keyInput.className = 'setting-input';
-    keyInput.placeholder = cfg.configured
-      ? `key ${cfg.keyMask} (blank = keep)`
-      : 'API key';
-    row.appendChild(keyInput);
-
-    const status = document.createElement('div');
-    status.className = 'setting-status';
-    status.textContent = cfg.configured ? `configured (${cfg.keyMask})` : 'no key';
-    row.appendChild(status);
-
-    const actions = document.createElement('div');
-    actions.className = 'setting-actions';
-
-    const saveBtn = document.createElement('button');
-    saveBtn.type = 'button';
-    saveBtn.className = 'ghost-btn';
-    saveBtn.textContent = 'Save';
-    saveBtn.addEventListener('click', () =>
-      saveSetting(provider, baseInput.value.trim(), keyInput.value)
-    );
-    actions.appendChild(saveBtn);
-
-    const removeBtn = document.createElement('button');
-    removeBtn.type = 'button';
-    removeBtn.className = 'ghost-btn danger';
-    removeBtn.textContent = 'Remove';
-    removeBtn.disabled = !cfg.configured;
-    removeBtn.addEventListener('click', () => removeSetting(provider));
-    actions.appendChild(removeBtn);
-
-    row.appendChild(actions);
-    els.settingsList.appendChild(row);
+  // byok: one row per provider the server's catalog names (GET
+  // /api/v1/byok/providers via the engine's listModels('byok')), not a fixed
+  // pair like the two custom endpoints above — the catalog is the source of
+  // truth so a provider added server-side shows up here with no client
+  // release. No base-URL field: byok always talks to AEGIS's own relay
+  // (/api/v1/byok/chat/completions), which is what attaches the AEGIS key
+  // and makes the call billable — the provider key typed here authenticates
+  // to the UPSTREAM provider only.
+  try {
+    const byokData = await models.listModels('byok');
+    const byokProviders = Array.isArray(byokData && byokData.providers) ? byokData.providers : [];
+    for (const p of byokProviders) {
+      if (!p || !p.id) continue;
+      const provider = `byok:${p.id}`;
+      const local = settings.find((s) => s.provider === provider) || {
+        provider, baseURL: '', configured: false, keyMask: null,
+      };
+      els.settingsList.appendChild(buildSettingRow({
+        provider, name: `BYOK: ${p.label || p.id}`, cfg: local, showBaseURL: false,
+        onSave: (_baseURL, key) => saveSetting(provider, '', key),
+        onRemove: () => removeSetting(provider),
+      }));
+    }
+  } catch {
+    /* catalog unreachable (offline, server down) — the two custom rows above still work */
   }
 }
 
@@ -2311,6 +2934,12 @@ function renderSyncStatus(status) {
   if (status.lastSyncAt) {
     bits.push(`last synced ${new Date(status.lastSyncAt).toLocaleTimeString()}`);
   }
+  // The heartbeat retry's last failure (main.js createHeartbeatRetry). It is
+  // fire-and-forget, so this is the only place its reason is visible instead of
+  // being swallowed by an empty catch.
+  if (status.retry && status.retry.lastError) {
+    bits.push(`last sync attempt failed: ${status.retry.lastError}`);
+  }
   els.syncStatus.textContent = bits.join(' · ');
 }
 
@@ -2325,6 +2954,41 @@ async function refreshSyncStatus() {
 /** Explicit "Sync now" — push pending sessions, then pull remote ones.
  *  Offline-first: sync.push()/sync.pull() resolve `{ ok:false, reason }`
  *  rather than throwing, so this only hits the catch on an unexpected error. */
+/**
+ * Persisting memory after a turn: ask main to push what just finished.
+ *
+ * Deliberately unawaited — the answer is already on screen and in the local
+ * session store, so cloud memory is strictly extra and the composer must come
+ * back the moment the answer lands, not after a round trip. The decision to
+ * push at all is main's (lib/sync/persist-gate.js reads the `__memoryPersist`
+ * preference off disk and returns `{ skipped: true }` when it is off); this is
+ * a request, not a gate, which is why no preference is read here.
+ *
+ * It cannot throw — createAutoPush resolves on every failure — but the
+ * `.catch` stays: an unhandled rejection in the renderer is how a background
+ * convenience turns into a fatal.
+ */
+function autoPersistTurn() {
+  if (typeof sync.auto !== 'function') return;
+  sync
+    .auto()
+    .then((result) => {
+      // Same notice as syncNow(): the cap is the one sync outcome the user
+      // must see rather than have silently absorbed.
+      if (result && result.upgrade) {
+        capNotice(
+          els.sessionsHint,
+          result.upgrade,
+          'queued memory is waiting on the free-plan cap',
+          'Upgrade to sync it →'
+        );
+      }
+    })
+    .catch(() => {
+      /* persistence is non-fatal */
+    });
+}
+
 async function syncNow() {
   els.syncNow.disabled = true;
   els.sessionsHint.textContent = 'syncing…';
@@ -2378,6 +3042,15 @@ function openSession(id) {
       // its on-screen transcript — continuing it as sessionId reuses the same
       // id and threadMessages carries the prior turns into the next send().
       currentSessionId = s.id;
+      // A resumed thread resumes its spend too. The shared store's ledger rows
+      // carry `tokens`/`costUsd` (client/session-store.js recordExchange writes
+      // exactly the shape rollMessages reads), so the rolling total is rebuilt
+      // from what was really recorded rather than restarting at zero — the
+      // CLI's aggregateSessionUsage, which sums history.jsonl for the same
+      // reason. A row this window wrote before ledgerFields existed carries no
+      // `tokens` and folds as unaccounted, which is stated rather than guessed.
+      rollsBySession.set(s.id, rollMessages(msgs));
+      renderRollMeter(s.id);
       threadMessages = msgs
         .filter((m) => m.role === 'user' || m.role === 'assistant')
         .map((m) => ({ role: m.role, content: m.content || m.text || '' }));
@@ -2432,6 +3105,12 @@ function newChat() {
   currentSessionId = null;
   threadMessages = [];
   flowCount = 0;
+  // A fresh thread opens with an empty meter. The outgoing session's roll is
+  // left in the map (reopening it rebuilds from the store anyway), but the
+  // topbar must not keep showing the thread the user just left — `sessionId`
+  // nulls out here and the new id is minted on the first send, so nothing is
+  // hidden that will not reappear with this thread's own number.
+  renderRollMeter(null);
 }
 
 /**
@@ -2481,22 +3160,23 @@ async function send() {
   userStopped = false;
   addMessage('user', prompt);
 
-  const ceiling = applyMaxTokensClamp(model);
-  // Aegis Cloud takes no token cap from here at all: the server sizes the call
-  // from `effort`, and a number in this position is a per-pass ceiling *over*
-  // that ladder (aegis1 services/pool_brain.py pass_budgets). Sending the
-  // dropdown's value anyway is what made "Max tokens: 4k" beside a turn a
-  // figure the turn never ran on. The row is hidden for this class as well, so
-  // the two controls can never disagree.
-  const maxTokens = cls === AUTONOMOUS_CLASS
-    ? undefined
-    : maxTokensAdaptive() ? ceiling : parseInt(els.maxTokens.value, 10) || 4096;
+  // What this request travels with, resolved from ONE authority by budgetFor:
+  // the Effort rung for a model that reasons against its own output budget (or
+  // a class that requires the field), and no `max_tokens` at all otherwise.
+  // Nothing here guesses an answer's length — the old dropdown asked the user
+  // to, and the guess was wrong in both directions: aegis1 sizes the pooled
+  // class from `effort` itself and reads a body max_tokens as a ceiling *over*
+  // its ladder (services/pool_brain.py pass_budgets), while a DeepSeek
+  // reasoning model bills hidden chain-of-thought against this same budget, so
+  // the 4k default was spent before the first visible token.
   const autonomous = cls === AUTONOMOUS_CLASS && autonomousEnabled();
-  // Sent for the pooled class whether or not the fan-out is ticked: the fan-out
-  // is enabled by the model id this class sends, so a turn that never entered
-  // autonomous mode still ran pooled and had no way to say how big it should
-  // be. `undefined` = "auto" = the server infers it from the ask.
-  const effort = effortFor(cls);
+  // Sent whether or not the fan-out is ticked: the fan-out is enabled by the
+  // model id the pooled class sends, so a turn that never entered autonomous
+  // mode still ran pooled and had no way to say how big it should be — and a
+  // DeepSeek reasoning model needs it to size its CoT. `undefined` = "auto" =
+  // the server (or the engine's rung default) infers it.
+  const effort = effortFor();
+  const maxTokens = budgetFor(cls, model, undefined, effort);
   const workers = autonomous ? parseInt(els.autonomousWorkers.value, 10) || undefined : undefined;
   // Reuse the open thread's session id (minted once, on its first message)
   // instead of a fresh one per send — a new id every turn is what made both
@@ -2539,6 +3219,10 @@ async function send() {
     }
     const bodyEl = pendingEl.querySelector('.body');
     if (bodyEl && bodyEl.textContent !== streamedText) bodyEl.textContent = streamedText;
+    // Live estimate so the topbar meter keeps moving while the reply streams
+    // in, instead of sitting frozen on the previous turn's total until this
+    // one resolves — see renderRollMeter's `live` param.
+    renderRollMeter(sessionId, { prompt, reply: streamedText, reasoning: reasoningText });
     stickToBottom();
   });
 
@@ -2561,6 +3245,11 @@ async function send() {
       return;
     }
     if (chunk && chunk.tool) {
+      // See the flow-stream handler above: the run frame is the CLI's live
+      // row. Ignored here, and ignored *before* `toolLog.push` — a run frame
+      // counted as a completed tool would inflate the turn summary's tool
+      // count for a call that hasn't run yet.
+      if (chunk.tool.phase === 'run') { captureDiffPreview(chunk.tool); return; }
       toolLog.push(chunk.tool);
       const row = ensurePendingRow();
       row.classList.remove('pending');
@@ -2598,16 +3287,73 @@ async function send() {
     // class it is what sized the call, and a user cannot tell a 16k turn from a
     // 64k one by looking at the answer.
     else if (effort) bits.push(`effort: ${effort}`);
-    const turnTokens = usageTokens(data && data.usage);
-    if (turnTokens != null) bits.push(`tokens: ${turnTokens}`);
+    // Tokens AND what they cost, on the CLI's rule: a pooled turn's settled
+    // charge (`costUsd`) is reported verbatim, and only a turn without one is
+    // priced from the local rate table and marked an estimate. Printing tokens
+    // alone left this surface with no comparable meter at all — the desktop
+    // and the CLI run the same engine, so a gap between them had to be
+    // measured on the same prompt, and one side was not measuring.
+    const turn = turnAccounting(data && data.usage, model, {
+      costUsd: data && typeof data.costUsd === 'number' ? data.costUsd : undefined,
+    });
+    if (turn.tokens != null) bits.push(`tokens: ${turn.tokens}`);
+    // A turn the wire did not report on still gets a figure — the same text
+    // estimate that goes into the session total, marked `~` so an inferred
+    // count is never read as a reported one. Printing nothing here while the
+    // session total moved was the other half of "the counter looks dead".
+    else {
+      const est = estimatedBuckets(prompt, text, text === reasoningText ? '' : reasoningText);
+      if (est) bits.push(`~${est.input + est.output} tokens`);
+    }
+    if (turn.cost != null) bits.push(fmtCost(turn.cost, turn.real));
+    // …AND the running session total beside it, which is the number the CLI
+    // prints. The per-turn figure answers "what did that call cost"; only the
+    // rolling one answers "what has this conversation cost", and it was the
+    // missing half. Folded here rather than only on the meter so a turn that
+    // reported no usage still counts as a turn (rollTurn counts before it
+    // tests the count) instead of vanishing from the session.
+    const roll = foldRoll(sessionId, data && data.usage, {
+      model,
+      costUsd: data && typeof data.costUsd === 'number' ? data.costUsd : undefined,
+      calls: data && data.calls,
+      // The turn's own text, used ONLY when the wire reported no usage — so
+      // such a turn is estimated and counted rather than dropped. This is the
+      // CLI's `appendHistory` rule and the reason the total moves every turn.
+      prompt,
+      reply: text,
+      // The thinking trace is billed output and is not part of `text`, so it is
+      // counted here too — guarded, because the same string must never be
+      // estimated twice if a turn ever collapses the two into one.
+      reasoning: text === reasoningText ? '' : reasoningText,
+    });
+    const rollLine = fmtRoll(roll);
+    if (rollLine) bits.push(`session: ${rollLine}`);
     addMessage('assistant', text, bits.join(' · ') || undefined, sessionId, toolLog);
 
     try {
-      await sync.append(sessionId, { role: 'assistant', content: text });
+      await sync.append(sessionId, {
+        role: 'assistant',
+        content: text,
+        // The turn's ledger fields, so this window's spend survives the window
+        // — see ledgerFields. This is what makes the rolling meter the same
+        // quantity after a reopen as it was before one.
+        ...ledgerFields(data && data.usage, model, turn, {
+          prompt,
+          reply: text,
+          // The thinking trace is billed output and is not part of `text`; it
+          // has to persist too, or reopening the window rebuilds a roll short
+          // by the longest part of the turn.
+          reasoning: text === reasoningText ? '' : reasoningText,
+          calls: data && data.calls,
+        }),
+      });
       await sync.save({ id: sessionId, title: prompt.slice(0, 60) });
     } catch {
       /* persistence is non-fatal */
     }
+
+    // Persisting memory: the finished turn goes to the cloud on its own now.
+    autoPersistTurn();
 
     // The AI's second path: not awaited — the lane streams beside the thread
     // while the composer goes straight back to the user (chat flow D2.2).
@@ -2623,12 +3369,47 @@ async function send() {
     if (isCancellation(err, { userStopped })) {
       const text = streamedText || reasoningText || '(stopped before any output)';
       threadMessages.push({ role: 'assistant', content: text });
-      addMessage('assistant', text, 'stopped by you', sessionId, toolLog);
+      // A stopped turn is a real exchange and the CLI records one: its
+      // `appendHistory` writes a `status: 'stopped'` entry for every stopped
+      // turn, and `aggregateSessionUsage` sums it like any other. The desktop
+      // wrote `{role, content}` and folded nothing, so an Escape mid-answer
+      // left the session total standing still on a turn the provider had
+      // already billed. Folded here like any other turn; with no wire usage
+      // on this path the figure is the text estimate, marked `est` — and
+      // never a fabricated zero.
+      const turn = turnAccounting(undefined, model, {});
+      const roll = foldRoll(sessionId, undefined, {
+        model,
+        prompt,
+        reply: text,
+        reasoning: text === reasoningText ? '' : reasoningText,
+      });
+      const stopBits = ['stopped by you'];
+      if (turn.tokens != null) stopBits.push(`tokens: ${turn.tokens}`);
+      else {
+        const est = estimatedBuckets(prompt, text, text === reasoningText ? '' : reasoningText);
+        if (est) stopBits.push(`~${est.input + est.output} tokens`);
+      }
+      const stopRollLine = fmtRoll(roll);
+      if (stopRollLine) stopBits.push(`session: ${stopRollLine}`);
+      addMessage('assistant', text, stopBits.join(' · '), sessionId, toolLog);
       try {
-        await sync.append(sessionId, { role: 'assistant', content: text });
+        await sync.append(sessionId, {
+          role: 'assistant',
+          content: text,
+          ...ledgerFields(undefined, model, turn, {
+            prompt,
+            reply: text,
+            reasoning: text === reasoningText ? '' : reasoningText,
+          }),
+        });
       } catch {
         /* persistence is non-fatal */
       }
+      // A stopped turn is persisted too, and on purpose: this is the case a
+      // round-horizon stop produces (the model was cut off mid-work), and the
+      // partial transcript is exactly what the next turn needs restored.
+      autoPersistTurn();
     } else {
       addMessage(
         'assistant',
@@ -2683,22 +3464,8 @@ async function init() {
     renderStatus(null);
   }
 
-  const savedMax = localStorage.getItem(MAX_TOKENS_KEY);
-  if (savedMax) els.maxTokens.value = savedMax;
-
-  els.maxTokens.addEventListener('change', () => {
-    localStorage.setItem(MAX_TOKENS_KEY, els.maxTokens.value);
-  });
-
-  // Adaptive max tokens is opt-in per machine, remembered across restarts.
-  const savedAdaptive = localStorage.getItem(MAX_TOKENS_ADAPTIVE_KEY);
-  if (savedAdaptive === 'on') els.maxTokensAdaptive.checked = true;
-  els.maxTokensAdaptive.addEventListener('change', () => {
-    localStorage.setItem(MAX_TOKENS_ADAPTIVE_KEY, els.maxTokensAdaptive.checked ? 'on' : 'off');
-    const cls = els.classSelect.value;
-    const modelId = CUSTOM_CLASSES.has(cls) ? els.modelInput.value.trim() : els.modelSelect.value;
-    applyMaxTokensClamp(modelId);
-  });
+  // There is no max-tokens control to restore: it asked the user to state an
+  // answer's length before the answer existed, so it is gone (see budget.js).
 
   // Work-autonomously is opt-in per machine, remembered across restarts;
   // only ever sent when the active class is AEGIS Cloud (see AUTONOMOUS_CLASS).
@@ -2709,19 +3476,26 @@ async function init() {
     updateAutonomousControlsVisibility();
   });
 
-  // Budget control for the pooled class: which rung of the server's effort
-  // ladder sizes the call, or "auto" to let the server infer it from the ask
-  // (aegis1 services/pool_brain.py parse_brain_request). Opt-in per machine,
-  // remembered across restarts; a stored value from a build whose list was
-  // short (low/medium/high, no "auto") falls through to the markup's default
-  // rather than assigning an option that no longer exists.
-  const savedEffort = localStorage.getItem(AUTONOMOUS_EFFORT_KEY);
-  if (savedEffort && Array.from(els.autonomousEffort.options).some((o) => o.value === savedEffort)) {
-    els.autonomousEffort.value = savedEffort;
+  // The one budget control: which rung sizes the call, or "auto" to let the
+  // server infer it from the ask (aegis1 services/pool_brain.py
+  // parse_brain_request). Applies to EVERY class now — with the max-tokens
+  // dropdown gone there is nothing else that sizes a call — so it is no longer
+  // stored under the autonomous-mode namespace; an install predating the rename
+  // is read from the old key once, and a stored rung this build's list no
+  // longer offers falls through to the markup's default rather than assigning
+  // an option that does not exist.
+  const savedEffort = localStorage.getItem(EFFORT_KEY) || localStorage.getItem(LEGACY_EFFORT_KEY);
+  if (savedEffort && Array.from(els.effortSelect.options).some((o) => o.value === savedEffort)) {
+    els.effortSelect.value = savedEffort;
   }
-  els.autonomousEffort.addEventListener('change', () => {
-    localStorage.setItem(AUTONOMOUS_EFFORT_KEY, els.autonomousEffort.value);
+  els.effortSelect.addEventListener('change', () => {
+    localStorage.setItem(EFFORT_KEY, els.effortSelect.value);
+    updateBudgetControls(els.classSelect.value);
   });
+  // A typed model id changes what the rung buys (a DeepSeek reasoning id is
+  // sized by it, a plain OpenAI-compatible one sends no cap at all), so the
+  // note has to follow the keystrokes rather than wait for a class change.
+  els.modelInput.addEventListener('input', () => updateBudgetControls(els.classSelect.value));
   // Worker count for the fan-out. Left empty by default on purpose: an empty
   // field is what tells the server to size the fan-out from the ask
   // (parse_brain_request's auto path) instead of the old client-side default of
@@ -2733,9 +3507,17 @@ async function init() {
   });
   updateAutonomousControlsVisibility();
 
-  // The discovery lane is opt-in per machine, remembered across restarts.
+  // The discovery lane is opt-in, remembered across restarts.
+  //
+  // This used to read `savedExplore === 'off'` against a checkbox that shipped
+  // `checked` in index.html, i.e. the opposite of the comment above it: a fresh
+  // install (no `aegis.explore` key, and nothing had ever written one) landed
+  // with the lane ON and billed two extra model calls after every single turn —
+  // ~3× the tokens of a plain reply, silently, because the lane is
+  // fire-and-forget and never looks slow. Only an explicit 'on' turns it on
+  // now; every other state, including "never asked", means off.
   const savedExplore = localStorage.getItem(EXPLORE_KEY);
-  if (savedExplore === 'off') els.exploreToggle.checked = false;
+  els.exploreToggle.checked = savedExplore === 'on';
   els.exploreToggle.addEventListener('change', () => {
     localStorage.setItem(EXPLORE_KEY, els.exploreToggle.checked ? 'on' : 'off');
     if (!els.exploreToggle.checked) abortBranches();
@@ -2752,10 +3534,13 @@ async function init() {
   });
 
   els.modelSelect.addEventListener('change', () => {
-    const ceiling = applyMaxTokensClamp(els.modelSelect.value);
+    // Display-only (see budget.js): the model's own advertised output limit,
+    // which is never the number this app puts on a request.
+    const ceiling = maxTokensCeiling(modelMeta.get(els.modelSelect.value));
     const base = els.modelHint.textContent.replace(/ · max output: [\d,]+$/, '');
     els.modelHint.textContent =
       ceiling < FLAT_CEILING ? `${base} · max output: ${ceiling.toLocaleString()}` : base;
+    updateBudgetControls(els.classSelect.value);
   });
 
   els.modelPreset.addEventListener('change', () => {
@@ -2866,6 +3651,42 @@ async function init() {
       renderMemoryOverlay();
     });
   }
+  // ── the autonomous queue card ────────────────────────────────────────────
+  // The queue half of this file (window.queue -> main.js registerQueueIpc ->
+  // desktop/lib/local/queue.js + autonomous.js) shipped with every handler
+  // written and none of them reachable: no listener on the four buttons, no
+  // paint at boot, no subscriber to the drain's progress channel. So the card
+  // was dead markup — a Queue / Run one / Drain all / Stop row that did
+  // nothing and a task list that never filled, while the module comments above
+  // described the behaviour as if it were live. This block is the missing
+  // wiring, and deliberately nothing more.
+  //
+  // Draining stays a click, exactly as the queue section above promises:
+  // nothing here starts a drain. There is no interval, no drain-on-idle and no
+  // drain at boot — the one call made here is loadQueueState(), which asks
+  // main for queue.list() and paints it.
+  //
+  // The `queueApi` guard is the preload-less case (a preload predating the
+  // queue surface has no `window.queue` at all): binding `undefined.list` would
+  // throw at boot and take every binding after this point down with it, so an
+  // old preload degrades to dead markup instead.
+  if (queueApi) {
+    if (els.queueEnqueue) els.queueEnqueue.addEventListener('click', enqueueQueueTask);
+    // `Run one` and `Drain all` are the two buttons the header of the queue
+    // section names as the only triggers of a drain; Stop cancels the turn in
+    // flight and the loop (via main), it never starts one.
+    if (els.queueDrain) els.queueDrain.addEventListener('click', () => startQueueDrain('one'));
+    if (els.queueProceed) els.queueProceed.addEventListener('click', () => startQueueDrain('all'));
+    if (els.queueStop) els.queueStop.addEventListener('click', stopQueueDrain);
+    // A worker's frames are a status line, never transcript entries (that
+    // separation is main.js's own progress channel, not aegis:chatDelta).
+    if (typeof queueApi.onProgress === 'function') queueApi.onProgress(renderQueueProgress);
+    // Paint the card once, from state that already exists on disk. A list, not a
+    // drain: queueing a task in another window (or from the CLI) and opening
+    // this one must show that task, and must not run it.
+    await loadQueueState();
+  }
+
   // The transcript's scroll/paint/Escape policy. Both listeners are registered
   // inside transcript-view.js so the behaviours they enforce are the ones
   // test/renderer-dom.test.mjs drives: the passive `scroll` listener is the
@@ -2917,6 +3738,22 @@ async function init() {
     els.updateRestartBtn.addEventListener('click', () => {
       aegis.quitAndInstallUpdate();
     });
+
+    // A failed check used to have no affordance at all: the only way back was
+    // the app menu, which nobody who just read "Update check failed" would
+    // think to open. Retry re-checks explicitly, which also means the main
+    // process will report a further failure instead of swallowing it.
+    if (els.updateRetryBtn && aegis.checkForUpdates) {
+      els.updateRetryBtn.addEventListener('click', () => {
+        els.updateRetryBtn.disabled = true;
+        Promise.resolve(aegis.checkForUpdates())
+          .then(renderUpdateBanner)
+          .catch(() => {})
+          .finally(() => {
+            els.updateRetryBtn.disabled = false;
+          });
+      });
+    }
 
     els.updateLaterBtn.addEventListener('click', () => {
       updateDismissedFor = lastUpdateState && lastUpdateState.status;

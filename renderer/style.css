@@ -114,6 +114,28 @@ body {
   box-shadow: 0 0 6px var(--teal);
 }
 
+/* The rolling session token total — the CLI's status-bar figure, in the
+   topbar. Muted and monospaced so it reads as a meter rather than a heading,
+   and it never wraps: a number that reflows the topbar every turn is worse
+   than no number at all. Hidden via the `hidden` attribute, so the rule below
+   has to win against the flex display the base class would otherwise get. */
+.session-meter {
+  font-size: 12px;
+  font-family: var(--font-mono);
+  color: var(--text2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 40ch;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+
+.session-meter[hidden] {
+  display: none;
+}
+
 .spacer {
   flex: 1;
 }
@@ -1207,15 +1229,19 @@ body.memory-open {
 
 
 
-.max-tokens-row {
+.budget-row {
   display: flex;
   align-items: center;
   gap: 8px;
 }
 
-.max-tokens-row select {
+.budget-row select {
   flex: 1;
   min-width: 0;
+}
+
+.budget-hint {
+  margin-top: 4px;
 }
 
 #autonomous-toggle-wrap {
@@ -1230,13 +1256,11 @@ body.memory-open {
   display: none;
 }
 
-/* Same trap, one row up: `.max-tokens-row` is display: flex, so the `hidden`
-   attribute did nothing on `#max-tokens-row`/`#effort-row` — which is how the
-   budget-control swap (effort for the pooled class, a token ceiling for the
-   others) would have shown BOTH controls at once, the exact state it exists to
-   prevent. `display: none` is also what lets a `<label>` be hidden, since
-   labels are inline by default and carry no author display rule. */
-.max-tokens-row[hidden],
+/* A `<label>` is inline by default and carries no author display rule, so the
+   UA stylesheet's `[hidden] { display: none }` wins for it unaided — this
+   override exists only for labels a later rule gives a display value to.
+   (The row itself no longer needs it: with the max-tokens control gone there
+   is nothing left to swap #effort-row for.) */
 label[hidden] {
   display: none;
 }
@@ -2036,4 +2060,74 @@ body.is-scrolled .composer {
   .memory-scroll {
     scroll-behavior: auto;
   }
+}
+
+/* ---- File-edit diff blocks (renderer/diffview.js) -------------------------
+   A file-editing tool call renders as a collapsible, clickable, syntax-colored
+   diff instead of a bare gray tool line, so the one thing a coding session is
+   actually about — what changed — is visible without a second gesture. Scoped
+   under .diff-block on purpose: the approval card already owns .diff-add /
+   .diff-del / .diff-ctx (above) for its own pre-run preview, and this must not
+   restyle those. The rows read as one continuous full-width block (block-level
+   .diff-row, no per-row gaps) and the palette matches cli/src/theme.js's DIFF
+   object so the desktop and CLI blocks look like the same object. */
+.diff-block {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.45;
+  width: 100%;
+  overflow-x: auto;
+  margin: 1px 0 2px;
+}
+
+.diff-summary {
+  cursor: pointer;
+  white-space: pre;
+  padding: 1px 0;
+}
+
+.diff-summary:hover {
+  filter: brightness(1.2);
+}
+
+.diff-body {
+  display: block;
+}
+
+.diff-row {
+  display: flex;
+  white-space: pre;
+  width: 100%;
+}
+
+.diff-block .diff-add {
+  background: #022800;
+  color: #50c850;
+}
+
+.diff-block .diff-del {
+  background: #3d0100;
+  color: #dc5a5a;
+}
+
+.diff-block .diff-ctx {
+  color: #f8f8f2;
+}
+
+.diff-block .diff-marker {
+  color: #75715e;
+  font-style: italic;
+}
+
+.diff-block .diff-gutter {
+  color: #787878;
+  user-select: none;
+}
+
+.diff-block .diff-sign {
+  padding: 0 6px 0 4px;
+}
+
+.diff-block .diff-code {
+  white-space: pre;
 }

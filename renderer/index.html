@@ -22,6 +22,11 @@
       <span class="dot" id="conn-dot"></span>
       <span id="conn-text">connecting…</span>
     </div>
+    <!-- The rolling session token total, counted the way the CLI counts it:
+         every finished turn folded into one running number rather than a
+         per-turn count that resets. Hidden until a turn has been accounted
+         for, so an untouched thread never shows a `0 tok` it never measured. -->
+    <div class="session-meter" id="session-meter" hidden></div>
     <div class="spacer"></div>
     <button type="button" id="new-chat" class="ghost-btn">New chat</button>
   </header>
@@ -31,6 +36,7 @@
     <div class="update-banner-actions">
       <button type="button" id="update-download-btn" class="ghost-btn" hidden>Download</button>
       <button type="button" id="update-restart-btn" class="ghost-btn" hidden>Restart to install</button>
+      <button type="button" id="update-retry-btn" class="ghost-btn" hidden>Retry</button>
       <button type="button" id="update-later-btn" class="ghost-btn">Later</button>
     </div>
   </div>
@@ -95,35 +101,35 @@
           hidden
         />
 
-        <label for="max-tokens" id="max-tokens-label">Max tokens</label>
-        <div class="max-tokens-row" id="max-tokens-row">
-          <select id="max-tokens">
-            <option value="1024">1k</option>
-            <option value="4096" selected>4k</option>
-            <option value="16384">16k</option>
-            <option value="64000">64k</option>
-            <option value="300000">300k</option>
-          </select>
-          <label
-            class="flow-toggle"
-            for="max-tokens-adaptive"
-            title="Automatically use the highest output ceiling the selected model supports, up to 300k tokens, instead of the fixed choice above."
-          >
-            <input type="checkbox" id="max-tokens-adaptive" />
-            <span>adaptive</span>
-          </label>
-        </div>
+        <!-- The one budget control, for every class and every model.
 
-        <!-- The pooled AEGIS Cloud class sizes a request's token budget
-             server-side from this ladder (effort -> low/medium/high ->
-             16384/32768/65536 total across the fan-out), so the max-tokens row
-             above is hidden for that class instead of being shown and silently
-             overridden: the server treats a body max_tokens as a ceiling, and
-             an effort rung as the budget. Shown for Ollama and custom
-             endpoints, where a per-call ceiling is the only control there is. -->
-        <div class="max-tokens-row" id="effort-row" hidden>
-          <label for="autonomous-effort">Effort</label>
-          <select id="autonomous-effort">
+             It replaced a "Max tokens" dropdown (1k/4k/16k/64k/300k plus an
+             "adaptive" checkbox) that asked the user to state, up front, how
+             many tokens an answer would need. That cannot be known from the
+             prompt — it is a guess at the length of text nobody has written
+             yet — and the guess was wrong in both directions:
+
+               - the pooled AEGIS Cloud class sizes each call server-side from
+                 effort (aegis1 services/pool_brain.py pass_budgets:
+                 low/medium/high -> 16384/32768/65536 tokens total across the
+                 worker fan-out), and it reads a body max_tokens as a ceiling
+                 OVER that ladder, so the number on screen was never the
+                 budget the call ran on;
+               - a DeepSeek reasoning model (deepseek-flash, i.e. "Flash 4.1")
+                 bills hidden chain-of-thought against the same budget as its
+                 answer, so the dropdown's 4k default was spent before the
+                 first visible token and the turn came back empty — no error,
+                 no tool call, just a turn that "completed" with nothing.
+
+             So the budget is derived from this rung instead. The engine maps
+             low/medium/high to 8192/16384/32768 (EFFORT_TOKEN_BUDGET in
+             desktop/lib/local/engine.js, mirroring aegiscodex-dev's
+             src/backend.js), "auto" leaves the choice to the server, and no
+             max_tokens is stated by this app at all. The row is always on
+             screen: with the dropdown gone there is nothing to swap it for. -->
+        <div class="budget-row" id="effort-row">
+          <label for="effort-select" title="Sizes the call's token budget. Output length cannot be predicted from the prompt, so the budget comes from this rung instead of a stated number.">Effort</label>
+          <select id="effort-select">
             <option value="low">low</option>
             <option value="medium">medium</option>
             <option value="high">high</option>
@@ -131,19 +137,31 @@
           </select>
         </div>
 
+        <!-- What the rung above means for the model selected right now, in
+             tokens. Written only by updateBudgetControls (app.js), so it cannot
+             disagree with the request that follows it. -->
+        <p class="hint budget-hint" id="budget-hint"></p>
+
         <label
           class="flow-toggle"
           for="autonomous-toggle"
           id="autonomous-toggle-wrap"
           hidden
-          title="Let the model work autonomously: fan out to multiple reasoning workers and synthesize their findings into one answer. Aegis Cloud models only."
+          title="Fan THIS chat turn out to several Aegis Cloud reasoning workers and synthesize their findings into one answer. Aegis Cloud only, and off by default because it costs about (workers + 1) full model calls per turn. This is a per-turn setting for the thread; it does not govern the unattended queue below, which runs each queued task on a single pass unless that task asks for the fan-out."
         >
           <input type="checkbox" id="autonomous-toggle" />
-          <span>work autonomously</span>
+          <span>fan out this turn</span>
         </label>
         <div id="autonomous-controls" class="autonomous-controls" hidden>
           <label for="autonomous-workers">Workers</label>
-          <input type="number" id="autonomous-workers" min="1" max="8" step="1" />
+          <input
+            type="number"
+            id="autonomous-workers"
+            min="1"
+            max="8"
+            step="1"
+            title="How many reasoning workers this turn fans out to. Every worker is a separate full model call on the same tier, so the turn costs roughly this number plus one times a normal one — higher is not automatically better."
+          />
         </div>
         <p class="hint" id="model-hint"></p>
       </section>
@@ -235,6 +253,50 @@
         </button>
         <p class="hint" id="memory-hint"></p>
       </section>
+
+      <section class="card">
+        <!-- The local autonomous work queue (desktop/lib/local/queue.js +
+             autonomous.js, exposed as window.queue). This card is the WHOLE
+             gate on it: a task runs only when one of the two buttons below is
+             clicked. There is no drain-at-startup and no interval anywhere in
+             app.js or main.js, because a drain spends real money on a real
+             model inside the folder named here.
+
+             The list below is state, not a transcript: the worker's own output
+             arrives on queue:progress and is shown as a status line and each
+             task's outcome. Nothing from a drain enters the chat thread. -->
+        <h2>Autonomous queue</h2>
+        <textarea
+          id="queue-task"
+          rows="2"
+          placeholder="Queue a task to run unattended…"
+        ></textarea>
+        <div class="api-key-row">
+          <input
+            type="text"
+            id="queue-cwd"
+            placeholder="/path/to/repo"
+            autocomplete="off"
+            title="The directory the task's tool loop runs in. Must already exist."
+          />
+          <button type="button" id="queue-enqueue" class="ghost-btn">Queue</button>
+        </div>
+        <label
+          class="flow-toggle"
+          for="queue-commit"
+          title="Commit the paths this task's own tool calls wrote, once it finishes. Anything else dirty in that checkout is left alone."
+        >
+          <input type="checkbox" id="queue-commit" />
+          <span>commit what the task changes</span>
+        </label>
+        <div class="api-key-row">
+          <button type="button" id="queue-drain" class="ghost-btn">Run one</button>
+          <button type="button" id="queue-proceed" class="ghost-btn">Drain all</button>
+          <button type="button" id="queue-stop" class="ghost-btn" hidden>Stop</button>
+        </div>
+        <ul class="sessions-list" id="queue-list"></ul>
+        <p class="hint" id="queue-hint"></p>
+      </section>
     </aside>
 
     <section class="chat">
@@ -296,9 +358,12 @@
           <label
             class="flow-toggle"
             for="explore-toggle"
-            title="After every answer, send the AI down two extra paths — an alternative angle and an unexpected discovery — shown as a horizontal discovery lane."
+            title="Optional, off by default. After every answer, send the AI down two extra paths — an alternative angle and an unexpected discovery — shown as a horizontal discovery lane. This costs two extra model calls per turn (roughly 3× the tokens of a plain reply)."
           >
-            <input type="checkbox" id="explore-toggle" checked />
+            <!-- Unchecked in the markup on purpose: the lane bills two extra
+                 model calls per turn, so it is opt-in. app.js only ticks this
+                 when the user has explicitly saved 'on' (aegis.explore). -->
+            <input type="checkbox" id="explore-toggle" />
             <span>discovery lane</span>
           </label>
           <button type="submit" id="send">Send</button>
@@ -375,10 +440,12 @@
     </div>
   </div>
 
-  <script src="max-tokens.js"></script>
+  <script src="budget.js"></script>
   <script src="usage.js"></script>
   <script src="stream-policy.js"></script>
   <script src="transcript-view.js"></script>
+  <script src="diff.js"></script>
+  <script src="diffview.js"></script>
   <script src="vendor/marked.umd.js"></script>
   <script src="vendor/purify.min.js"></script>
   <script src="vendor/aegis-highlight.js"></script>
